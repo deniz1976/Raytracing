@@ -5,6 +5,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0, rgba8) uniform writeonly image2D u_OutputImage;
 
 const int SPHERE_COUNT = 4;
+const float RAY_EPSILON = 0.001;
 
 struct Ray
 {
@@ -53,11 +54,11 @@ float HitSphere(Ray ray, Sphere sphere)
 
 	float squareRoot = sqrt(discriminant);
 	float nearestDistance = (-b - squareRoot) / (2.0 * a);
-	if (nearestDistance > 0.001)
+	if (nearestDistance > RAY_EPSILON)
 		return nearestDistance;
 
 	float farthestDistance = (-b + squareRoot) / (2.0 * a);
-	if (farthestDistance > 0.001)
+	if (farthestDistance > RAY_EPSILON)
 		return farthestDistance;
 
 	return -1.0;
@@ -89,13 +90,35 @@ bool TraceScene(
 	return hitAnything;
 }
 
+bool IsOccluded(
+	vec3 surfacePosition,
+	vec3 surfaceNormal,
+	vec3 directionToLight,
+	Sphere spheres[SPHERE_COUNT])
+{
+	Ray shadowRay;
+	shadowRay.Origin = surfacePosition + surfaceNormal * RAY_EPSILON;
+	shadowRay.Direction = directionToLight;
+
+	for (int sphereIndex = 0; sphereIndex < SPHERE_COUNT; sphereIndex++)
+	{
+		if (HitSphere(shadowRay, spheres[sphereIndex]) > 0.0)
+			return true;
+	}
+
+	return false;
+}
+
 vec3 CalculateDirectionalLight(
 	DirectionalLight light,
 	Material material,
-	vec3 surfaceNormal)
+	vec3 surfaceNormal,
+	float lightVisibility)
 {
 	vec3 directionToLight = normalize(-light.Direction);
-	float diffuseStrength = max(dot(surfaceNormal, directionToLight), 0.0);
+	float diffuseStrength =
+		max(dot(surfaceNormal, directionToLight), 0.0) *
+		lightVisibility;
 
 	vec3 ambientColor = material.Albedo * 0.08;
 	vec3 diffuseColor =
@@ -158,10 +181,19 @@ void main()
 
 	if (TraceScene(ray, spheres, closestHit))
 	{
+		vec3 directionToLight = normalize(-sun.Direction);
+		bool isInShadow = IsOccluded(
+			closestHit.Position,
+			closestHit.Normal,
+			directionToLight,
+			spheres);
+
+		float lightVisibility = isInShadow ? 0.0 : 1.0;
 		color = CalculateDirectionalLight(
 			sun,
 			closestHit.SurfaceMaterial,
-			closestHit.Normal);
+			closestHit.Normal,
+			lightVisibility);
 	}
 	else
 	{

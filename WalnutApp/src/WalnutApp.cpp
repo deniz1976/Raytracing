@@ -16,7 +16,7 @@ public:
 		m_Renderer.Render();
 
 		ImGui::Begin("Compute Shader Output");
-		ImGui::Text("Multiple spheres with closest-hit selection");
+		ImGui::Text("Hard shadows generated with secondary rays");
 		ImGui::Image(
 			(ImTextureID)m_Renderer.GetImageDescriptorSet(),
 			ImVec2((float)m_Renderer.GetWidth(), (float)m_Renderer.GetHeight()),
