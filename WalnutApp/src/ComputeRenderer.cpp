@@ -36,8 +36,9 @@ void ComputeRenderer::Init(const std::string& shaderPath, uint32_t width, uint32
 {
 	m_Width = width;
 	m_Height = height;
+	m_FrameIndex = 0;
 
-	CreateOutputImage();
+	CreateOutputImages();
 	CreateComputeDescriptors();
 	CreateComputePipeline(shaderPath);
 }
@@ -60,26 +61,31 @@ uint32_t ComputeRenderer::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFl
 	throw std::runtime_error("A suitable Vulkan memory type could not be found.");
 }
 
-void ComputeRenderer::CreateOutputImage()
+void ComputeRenderer::CreateImage(
+	VkFormat format,
+	VkImageUsageFlags usage,
+	VkImage& image,
+	VkDeviceMemory& memory,
+	VkImageView& imageView)
 {
 	VkDevice device = Walnut::Application::GetDevice();
 
 	VkImageCreateInfo imageInfo{};
 	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	imageInfo.imageType = VK_IMAGE_TYPE_2D;
-	imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+	imageInfo.format = format;
 	imageInfo.extent = { m_Width, m_Height, 1 };
 	imageInfo.mipLevels = 1;
 	imageInfo.arrayLayers = 1;
 	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-	imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	imageInfo.usage = usage;
 	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	check_vk_result(vkCreateImage(device, &imageInfo, nullptr, &m_OutputImage));
+	check_vk_result(vkCreateImage(device, &imageInfo, nullptr, &image));
 
 	VkMemoryRequirements memoryRequirements;
-	vkGetImageMemoryRequirements(device, m_OutputImage, &memoryRequirements);
+	vkGetImageMemoryRequirements(device, image, &memoryRequirements);
 
 	VkMemoryAllocateInfo allocationInfo{};
 	allocationInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -87,18 +93,37 @@ void ComputeRenderer::CreateOutputImage()
 	allocationInfo.memoryTypeIndex = FindMemoryType(
 		memoryRequirements.memoryTypeBits,
 		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-	check_vk_result(vkAllocateMemory(device, &allocationInfo, nullptr, &m_OutputImageMemory));
-	check_vk_result(vkBindImageMemory(device, m_OutputImage, m_OutputImageMemory, 0));
+	check_vk_result(vkAllocateMemory(device, &allocationInfo, nullptr, &memory));
+	check_vk_result(vkBindImageMemory(device, image, memory, 0));
 
 	VkImageViewCreateInfo viewInfo{};
 	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	viewInfo.image = m_OutputImage;
+	viewInfo.image = image;
 	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-	viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+	viewInfo.format = format;
 	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 	viewInfo.subresourceRange.levelCount = 1;
 	viewInfo.subresourceRange.layerCount = 1;
-	check_vk_result(vkCreateImageView(device, &viewInfo, nullptr, &m_OutputImageView));
+	check_vk_result(vkCreateImageView(device, &viewInfo, nullptr, &imageView));
+}
+
+void ComputeRenderer::CreateOutputImages()
+{
+	VkDevice device = Walnut::Application::GetDevice();
+
+	CreateImage(
+		VK_FORMAT_R8G8B8A8_UNORM,
+		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		m_OutputImage,
+		m_OutputImageMemory,
+		m_OutputImageView);
+
+	CreateImage(
+		VK_FORMAT_R32G32B32A32_SFLOAT,
+		VK_IMAGE_USAGE_STORAGE_BIT,
+		m_AccumulationImage,
+		m_AccumulationImageMemory,
+		m_AccumulationImageView);
 
 	VkSamplerCreateInfo samplerInfo{};
 	samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -113,17 +138,21 @@ void ComputeRenderer::CreateOutputImage()
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
-	VkImageMemoryBarrier layoutBarrier{};
-	layoutBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	layoutBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-	layoutBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	layoutBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-	layoutBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	layoutBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	layoutBarrier.image = m_OutputImage;
-	layoutBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	layoutBarrier.subresourceRange.levelCount = 1;
-	layoutBarrier.subresourceRange.layerCount = 1;
+	VkImageMemoryBarrier layoutBarriers[2]{};
+	for (VkImageMemoryBarrier& barrier : layoutBarriers)
+	{
+		barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		barrier.subresourceRange.levelCount = 1;
+		barrier.subresourceRange.layerCount = 1;
+	}
+	layoutBarriers[0].image = m_OutputImage;
+	layoutBarriers[1].image = m_AccumulationImage;
 
 	vkCmdPipelineBarrier(
 		commandBuffer,
@@ -132,7 +161,7 @@ void ComputeRenderer::CreateOutputImage()
 		0,
 		0, nullptr,
 		0, nullptr,
-		1, &layoutBarrier);
+		2, layoutBarriers);
 
 	Walnut::Application::FlushCommandBuffer(commandBuffer);
 
@@ -146,22 +175,25 @@ void ComputeRenderer::CreateComputeDescriptors()
 {
 	VkDevice device = Walnut::Application::GetDevice();
 
-	VkDescriptorSetLayoutBinding imageBinding{};
-	imageBinding.binding = 0;
-	imageBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	imageBinding.descriptorCount = 1;
-	imageBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	VkDescriptorSetLayoutBinding imageBindings[2]{};
+	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
+	{
+		imageBindings[bindingIndex].binding = bindingIndex;
+		imageBindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		imageBindings[bindingIndex].descriptorCount = 1;
+		imageBindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	}
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 1;
-	layoutInfo.pBindings = &imageBinding;
+	layoutInfo.bindingCount = 2;
+	layoutInfo.pBindings = imageBindings;
 	check_vk_result(vkCreateDescriptorSetLayout(
 		device, &layoutInfo, nullptr, &m_ComputeDescriptorSetLayout));
 
 	VkDescriptorPoolSize poolSize{};
 	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	poolSize.descriptorCount = 1;
+	poolSize.descriptorCount = 2;
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -179,18 +211,23 @@ void ComputeRenderer::CreateComputeDescriptors()
 	check_vk_result(vkAllocateDescriptorSets(
 		device, &allocateInfo, &m_ComputeDescriptorSet));
 
-	VkDescriptorImageInfo descriptorImage{};
-	descriptorImage.imageView = m_OutputImageView;
-	descriptorImage.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+	VkDescriptorImageInfo descriptorImages[2]{};
+	descriptorImages[0].imageView = m_OutputImageView;
+	descriptorImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+	descriptorImages[1].imageView = m_AccumulationImageView;
+	descriptorImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-	VkWriteDescriptorSet descriptorWrite{};
-	descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	descriptorWrite.dstSet = m_ComputeDescriptorSet;
-	descriptorWrite.dstBinding = 0;
-	descriptorWrite.descriptorCount = 1;
-	descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	descriptorWrite.pImageInfo = &descriptorImage;
-	vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+	VkWriteDescriptorSet descriptorWrites[2]{};
+	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
+	{
+		descriptorWrites[bindingIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[bindingIndex].dstSet = m_ComputeDescriptorSet;
+		descriptorWrites[bindingIndex].dstBinding = bindingIndex;
+		descriptorWrites[bindingIndex].descriptorCount = 1;
+		descriptorWrites[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		descriptorWrites[bindingIndex].pImageInfo = &descriptorImages[bindingIndex];
+	}
+	vkUpdateDescriptorSets(device, 2, descriptorWrites, 0, nullptr);
 }
 
 void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)
@@ -206,10 +243,17 @@ void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)
 	VkShaderModule shaderModule = VK_NULL_HANDLE;
 	check_vk_result(vkCreateShaderModule(device, &shaderInfo, nullptr, &shaderModule));
 
+	VkPushConstantRange pushConstantRange{};
+	pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	pushConstantRange.offset = 0;
+	pushConstantRange.size = sizeof(uint32_t);
+
 	VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
 	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 	pipelineLayoutInfo.setLayoutCount = 1;
 	pipelineLayoutInfo.pSetLayouts = &m_ComputeDescriptorSetLayout;
+	pipelineLayoutInfo.pushConstantRangeCount = 1;
+	pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
 	check_vk_result(vkCreatePipelineLayout(
 		device, &pipelineLayoutInfo, nullptr, &m_ComputePipelineLayout));
 
@@ -231,6 +275,8 @@ void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)
 
 void ComputeRenderer::Render()
 {
+	m_FrameIndex++;
+
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
 	vkCmdBindPipeline(
@@ -248,31 +294,45 @@ void ComputeRenderer::Render()
 		0,
 		nullptr);
 
+	vkCmdPushConstants(
+		commandBuffer,
+		m_ComputePipelineLayout,
+		VK_SHADER_STAGE_COMPUTE_BIT,
+		0,
+		sizeof(uint32_t),
+		&m_FrameIndex);
+
 	const uint32_t groupCountX = (m_Width + 7) / 8;
 	const uint32_t groupCountY = (m_Height + 7) / 8;
 	vkCmdDispatch(commandBuffer, groupCountX, groupCountY, 1);
 
-	VkImageMemoryBarrier computeToImGuiBarrier{};
-	computeToImGuiBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	computeToImGuiBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-	computeToImGuiBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-	computeToImGuiBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-	computeToImGuiBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-	computeToImGuiBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	computeToImGuiBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	computeToImGuiBarrier.image = m_OutputImage;
-	computeToImGuiBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	computeToImGuiBarrier.subresourceRange.levelCount = 1;
-	computeToImGuiBarrier.subresourceRange.layerCount = 1;
+	VkImageMemoryBarrier computeBarriers[2]{};
+	for (VkImageMemoryBarrier& barrier : computeBarriers)
+	{
+		barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+		barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		barrier.subresourceRange.levelCount = 1;
+		barrier.subresourceRange.layerCount = 1;
+	}
+
+	computeBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	computeBarriers[0].image = m_OutputImage;
+	computeBarriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	computeBarriers[1].image = m_AccumulationImage;
 
 	vkCmdPipelineBarrier(
 		commandBuffer,
 		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		0,
 		0, nullptr,
 		0, nullptr,
-		1, &computeToImGuiBarrier);
+		2, computeBarriers);
 
 	Walnut::Application::FlushCommandBuffer(commandBuffer);
 }
@@ -287,13 +347,17 @@ void ComputeRenderer::Release()
 	VkDescriptorPool descriptorPool = m_ComputeDescriptorPool;
 	VkDescriptorSetLayout descriptorSetLayout = m_ComputeDescriptorSetLayout;
 	VkSampler sampler = m_OutputSampler;
-	VkImageView imageView = m_OutputImageView;
-	VkImage image = m_OutputImage;
-	VkDeviceMemory imageMemory = m_OutputImageMemory;
+	VkImageView outputImageView = m_OutputImageView;
+	VkImage outputImage = m_OutputImage;
+	VkDeviceMemory outputImageMemory = m_OutputImageMemory;
+	VkImageView accumulationImageView = m_AccumulationImageView;
+	VkImage accumulationImage = m_AccumulationImage;
+	VkDeviceMemory accumulationImageMemory = m_AccumulationImageMemory;
 
 	Walnut::Application::SubmitResourceFree(
 		[pipeline, pipelineLayout, descriptorPool, descriptorSetLayout,
-		 sampler, imageView, image, imageMemory]()
+		 sampler, outputImageView, outputImage, outputImageMemory,
+		 accumulationImageView, accumulationImage, accumulationImageMemory]()
 		{
 			VkDevice device = Walnut::Application::GetDevice();
 			vkDestroyPipeline(device, pipeline, nullptr);
@@ -301,9 +365,12 @@ void ComputeRenderer::Release()
 			vkDestroyDescriptorPool(device, descriptorPool, nullptr);
 			vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 			vkDestroySampler(device, sampler, nullptr);
-			vkDestroyImageView(device, imageView, nullptr);
-			vkDestroyImage(device, image, nullptr);
-			vkFreeMemory(device, imageMemory, nullptr);
+			vkDestroyImageView(device, outputImageView, nullptr);
+			vkDestroyImage(device, outputImage, nullptr);
+			vkFreeMemory(device, outputImageMemory, nullptr);
+			vkDestroyImageView(device, accumulationImageView, nullptr);
+			vkDestroyImage(device, accumulationImage, nullptr);
+			vkFreeMemory(device, accumulationImageMemory, nullptr);
 		});
 
 	m_OutputImage = VK_NULL_HANDLE;

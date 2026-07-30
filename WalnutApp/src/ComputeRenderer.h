@@ -16,10 +16,17 @@ public:
 	VkDescriptorSet GetImageDescriptorSet() const { return m_ImGuiDescriptorSet; }
 	uint32_t GetWidth() const { return m_Width; }
 	uint32_t GetHeight() const { return m_Height; }
+	uint32_t GetFrameIndex() const { return m_FrameIndex; }
 
 private:
 	uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
-	void CreateOutputImage();
+	void CreateImage(
+		VkFormat format,
+		VkImageUsageFlags usage,
+		VkImage& image,
+		VkDeviceMemory& memory,
+		VkImageView& imageView);
+	void CreateOutputImages();
 	void CreateComputeDescriptors();
 	void CreateComputePipeline(const std::string& shaderPath);
 	void Release();
@@ -27,10 +34,16 @@ private:
 private:
 	uint32_t m_Width = 0;
 	uint32_t m_Height = 0;
+	uint32_t m_FrameIndex = 0;
 
 	VkImage m_OutputImage = VK_NULL_HANDLE;
 	VkDeviceMemory m_OutputImageMemory = VK_NULL_HANDLE;
 	VkImageView m_OutputImageView = VK_NULL_HANDLE;
+
+	VkImage m_AccumulationImage = VK_NULL_HANDLE;
+	VkDeviceMemory m_AccumulationImageMemory = VK_NULL_HANDLE;
+	VkImageView m_AccumulationImageView = VK_NULL_HANDLE;
+
 	VkSampler m_OutputSampler = VK_NULL_HANDLE;
 	VkDescriptorSet m_ImGuiDescriptorSet = VK_NULL_HANDLE;
 

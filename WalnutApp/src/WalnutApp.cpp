@@ -16,7 +16,9 @@ public:
 		m_Renderer.Render();
 
 		ImGui::Begin("Compute Shader Output");
-		ImGui::Text("Reflections with iterative ray bounces");
+		ImGui::Text(
+			"Progressive accumulation: %u samples per pixel",
+			m_Renderer.GetFrameIndex());
 		ImGui::Image(
 			(ImTextureID)m_Renderer.GetImageDescriptorSet(),
 			ImVec2((float)m_Renderer.GetWidth(), (float)m_Renderer.GetHeight()),
