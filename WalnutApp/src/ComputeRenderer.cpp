@@ -10,6 +10,17 @@
 
 namespace
 {
+	struct alignas(16) PushConstants
+	{
+		glm::vec4 CameraPosition;
+		glm::vec4 CameraForward;
+		uint32_t FrameIndex;
+		float VerticalFov;
+		glm::vec2 Padding;
+	};
+
+	static_assert(sizeof(PushConstants) == 48);
+
 	std::vector<uint32_t> ReadShaderFile(const std::string& path)
 	{
 		std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -59,6 +70,22 @@ uint32_t ComputeRenderer::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFl
 	}
 
 	throw std::runtime_error("A suitable Vulkan memory type could not be found.");
+}
+
+void ComputeRenderer::SetCamera(
+	const glm::vec3& position,
+	const glm::vec3& forward,
+	float verticalFov)
+{
+	m_CameraPosition = position;
+	m_CameraForward = glm::normalize(forward);
+	m_VerticalFov = verticalFov;
+	ResetAccumulation();
+}
+
+void ComputeRenderer::ResetAccumulation()
+{
+	m_FrameIndex = 0;
 }
 
 void ComputeRenderer::CreateImage(
@@ -246,7 +273,7 @@ void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)
 	VkPushConstantRange pushConstantRange{};
 	pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 	pushConstantRange.offset = 0;
-	pushConstantRange.size = sizeof(uint32_t);
+	pushConstantRange.size = sizeof(PushConstants);
 
 	VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
 	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -276,6 +303,11 @@ void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)
 void ComputeRenderer::Render()
 {
 	m_FrameIndex++;
+	PushConstants pushConstants{};
+	pushConstants.CameraPosition = glm::vec4(m_CameraPosition, 1.0f);
+	pushConstants.CameraForward = glm::vec4(m_CameraForward, 0.0f);
+	pushConstants.FrameIndex = m_FrameIndex;
+	pushConstants.VerticalFov = m_VerticalFov;
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
@@ -299,8 +331,8 @@ void ComputeRenderer::Render()
 		m_ComputePipelineLayout,
 		VK_SHADER_STAGE_COMPUTE_BIT,
 		0,
-		sizeof(uint32_t),
-		&m_FrameIndex);
+		sizeof(PushConstants),
+		&pushConstants);
 
 	const uint32_t groupCountX = (m_Width + 7) / 8;
 	const uint32_t groupCountY = (m_Height + 7) / 8;
