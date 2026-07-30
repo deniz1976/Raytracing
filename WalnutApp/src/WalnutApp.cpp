@@ -56,7 +56,7 @@ public:
 
 		ImGui::Begin("Compute Shader Output");
 		ImGui::Text(
-			"Progressive accumulation: %u samples per pixel",
+			"Rough reflections: %u samples per pixel",
 			m_Renderer.GetFrameIndex());
 		ImGui::Image(
 			(ImTextureID)m_Renderer.GetImageDescriptorSet(),
