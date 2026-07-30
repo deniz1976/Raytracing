@@ -160,7 +160,8 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		VkQueueFamilyProperties* queues = (VkQueueFamilyProperties*)malloc(sizeof(VkQueueFamilyProperties) * count);
 		vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &count, queues);
 		for (uint32_t i = 0; i < count; i++)
-			if (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+			if ((queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+				(queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT))
 			{
 				g_QueueFamily = i;
 				break;

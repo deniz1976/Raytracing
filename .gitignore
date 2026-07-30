@@ -8,6 +8,9 @@ bin-int/
 *.vcxproj.user
 *.vcxproj.filters
 *.sln
+*.spv
+imgui.ini
+LEARNING_NOTES.local.md
 
 # Exclude
 !vendor/bin

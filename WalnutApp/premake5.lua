@@ -5,7 +5,7 @@ project "WalnutApp"
    targetdir "bin/%{cfg.buildcfg}"
    staticruntime "off"
 
-   files { "src/**.h", "src/**.cpp" }
+   files { "src/**.h", "src/**.cpp", "src/**.comp" }
 
    includedirs
    {
@@ -25,6 +25,14 @@ project "WalnutApp"
 
    targetdir ("../bin/" .. outputdir .. "/%{prj.name}")
    objdir ("../bin-int/" .. outputdir .. "/%{prj.name}")
+   debugdir "%{wks.location}/WalnutApp"
+
+   local VulkanSDK = os.getenv("VULKAN_SDK")
+   prebuildcommands
+   {
+      "{MKDIR} \"%{wks.location}/WalnutApp/assets/shaders\"",
+      "\"" .. VulkanSDK .. "/Bin/glslc.exe\" \"%{wks.location}/WalnutApp/src/Shaders/RayTracing.comp\" -o \"%{wks.location}/WalnutApp/assets/shaders/RayTracing.comp.spv\""
+   }
 
    filter "system:windows"
       systemversion "latest"
