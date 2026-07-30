@@ -11,6 +11,7 @@ bin-int/
 *.spv
 imgui.ini
 LEARNING_NOTES.local.md
+PROJECT_HANDOFF.local.md
 
 # Exclude
 !vendor/bin
