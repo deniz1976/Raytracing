@@ -56,7 +56,7 @@ public:
 
 		ImGui::Begin("Compute Shader Output");
 		ImGui::Text(
-			"Rough reflections: %u samples per pixel",
+			"Soft shadows: %u samples per pixel",
 			m_Renderer.GetFrameIndex());
 		ImGui::Image(
 			(ImTextureID)m_Renderer.GetImageDescriptorSet(),
