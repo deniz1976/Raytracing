@@ -16,7 +16,7 @@ public:
 		m_Renderer.Render();
 
 		ImGui::Begin("Compute Shader Output");
-		ImGui::Text("Hard shadows generated with secondary rays");
+		ImGui::Text("Reflections with iterative ray bounces");
 		ImGui::Image(
 			(ImTextureID)m_Renderer.GetImageDescriptorSet(),
 			ImVec2((float)m_Renderer.GetWidth(), (float)m_Renderer.GetHeight()),
