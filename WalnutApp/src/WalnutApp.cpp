@@ -16,7 +16,7 @@ public:
 		m_Renderer.Render();
 
 		ImGui::Begin("Compute Shader Output");
-		ImGui::Text("Diffuse lighting computed on the GPU");
+		ImGui::Text("Multiple spheres with closest-hit selection");
 		ImGui::Image(
 			(ImTextureID)m_Renderer.GetImageDescriptorSet(),
 			ImVec2((float)m_Renderer.GetWidth(), (float)m_Renderer.GetHeight()),

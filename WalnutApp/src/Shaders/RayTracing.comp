@@ -4,6 +4,8 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, rgba8) uniform writeonly image2D u_OutputImage;
 
+const int SPHERE_COUNT = 4;
+
 struct Ray
 {
 	vec3 Origin;
@@ -29,6 +31,14 @@ struct DirectionalLight
 	float Intensity;
 };
 
+struct HitRecord
+{
+	float Distance;
+	vec3 Position;
+	vec3 Normal;
+	Material SurfaceMaterial;
+};
+
 float HitSphere(Ray ray, Sphere sphere)
 {
 	vec3 originToCenter = ray.Origin - sphere.Center;
@@ -51,6 +61,32 @@ float HitSphere(Ray ray, Sphere sphere)
 		return farthestDistance;
 
 	return -1.0;
+}
+
+bool TraceScene(
+	Ray ray,
+	Sphere spheres[SPHERE_COUNT],
+	out HitRecord closestHit)
+{
+	bool hitAnything = false;
+	closestHit.Distance = 1e30;
+
+	for (int sphereIndex = 0; sphereIndex < SPHERE_COUNT; sphereIndex++)
+	{
+		Sphere sphere = spheres[sphereIndex];
+		float hitDistance = HitSphere(ray, sphere);
+
+		if (hitDistance > 0.0 && hitDistance < closestHit.Distance)
+		{
+			hitAnything = true;
+			closestHit.Distance = hitDistance;
+			closestHit.Position = ray.Origin + ray.Direction * hitDistance;
+			closestHit.Normal = normalize(closestHit.Position - sphere.Center);
+			closestHit.SurfaceMaterial = sphere.SurfaceMaterial;
+		}
+	}
+
+	return hitAnything;
 }
 
 vec3 CalculateDirectionalLight(
@@ -94,27 +130,38 @@ void main()
 		screenPosition.y * fieldOfViewScale,
 		-1.0));
 
-	Sphere sphere;
-	sphere.Center = vec3(0.0, 0.0, 0.0);
-	sphere.Radius = 1.0;
-	sphere.SurfaceMaterial.Albedo = vec3(0.85, 0.18, 0.12);
+	Sphere spheres[SPHERE_COUNT];
+
+	spheres[0].Center = vec3(0.0, 0.0, 0.0);
+	spheres[0].Radius = 1.0;
+	spheres[0].SurfaceMaterial.Albedo = vec3(0.85, 0.18, 0.12);
+
+	spheres[1].Center = vec3(-2.1, 0.0, -1.0);
+	spheres[1].Radius = 1.0;
+	spheres[1].SurfaceMaterial.Albedo = vec3(0.12, 0.35, 0.85);
+
+	spheres[2].Center = vec3(2.1, 0.0, -1.0);
+	spheres[2].Radius = 1.0;
+	spheres[2].SurfaceMaterial.Albedo = vec3(0.15, 0.75, 0.28);
+
+	spheres[3].Center = vec3(0.0, -101.0, 0.0);
+	spheres[3].Radius = 100.0;
+	spheres[3].SurfaceMaterial.Albedo = vec3(0.55, 0.55, 0.55);
 
 	DirectionalLight sun;
 	sun.Direction = normalize(vec3(-1.0, -1.0, -1.0));
 	sun.Color = vec3(1.0, 0.95, 0.85);
 	sun.Intensity = 1.0;
 
-	float hitDistance = HitSphere(ray, sphere);
 	vec3 color;
+	HitRecord closestHit;
 
-	if (hitDistance > 0.0)
+	if (TraceScene(ray, spheres, closestHit))
 	{
-		vec3 hitPosition = ray.Origin + ray.Direction * hitDistance;
-		vec3 surfaceNormal = normalize(hitPosition - sphere.Center);
 		color = CalculateDirectionalLight(
 			sun,
-			sphere.SurfaceMaterial,
-			surfaceNormal);
+			closestHit.SurfaceMaterial,
+			closestHit.Normal);
 	}
 	else
 	{
