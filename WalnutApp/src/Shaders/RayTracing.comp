@@ -11,7 +11,8 @@ layout(push_constant) uniform PushConstants
 	vec4 CameraForward;
 	uint FrameIndex;
 	float VerticalFov;
-	vec2 Padding;
+	float Exposure;
+	float Padding;
 } u_PushConstants;
 
 const int SPHERE_COUNT = 4;
@@ -190,6 +191,16 @@ vec3 GetSkyColor(vec3 rayDirection)
 	vec3 horizonColor = vec3(1.0);
 	vec3 skyColor = vec3(0.5, 0.7, 1.0);
 	return mix(horizonColor, skyColor, skyBlend);
+}
+
+vec3 ToneMapReinhard(vec3 hdrColor)
+{
+	return hdrColor / (vec3(1.0) + hdrColor);
+}
+
+vec3 ApplyGammaCorrection(vec3 linearColor)
+{
+	return pow(max(linearColor, vec3(0.0)), vec3(1.0 / 2.2));
 }
 
 vec3 TraceRay(
@@ -371,5 +382,9 @@ void main()
 	vec3 averageColor =
 		accumulatedColor /
 		float(u_PushConstants.FrameIndex);
-	imageStore(u_OutputImage, pixel, vec4(averageColor, 1.0));
+
+	vec3 exposedColor = averageColor * u_PushConstants.Exposure;
+	vec3 toneMappedColor = ToneMapReinhard(exposedColor);
+	vec3 displayColor = ApplyGammaCorrection(toneMappedColor);
+	imageStore(u_OutputImage, pixel, vec4(displayColor, 1.0));
 }

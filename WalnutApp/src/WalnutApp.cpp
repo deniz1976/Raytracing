@@ -16,7 +16,7 @@ public:
 
 	virtual void OnUIRender() override
 	{
-		ImGui::Begin("Camera Controls");
+		ImGui::Begin("Camera and Render Controls");
 
 		bool cameraChanged = false;
 		cameraChanged |= ImGui::DragFloat3(
@@ -37,6 +37,15 @@ public:
 			&m_VerticalFov,
 			20.0f,
 			90.0f);
+
+		if (ImGui::SliderFloat(
+			"Exposure",
+			&m_Exposure,
+			0.1f,
+			4.0f))
+		{
+			m_Renderer.SetExposure(m_Exposure);
+		}
 
 		if (ImGui::Button("Reset Camera"))
 		{
@@ -89,6 +98,7 @@ private:
 	float m_CameraYaw = 0.0f;
 	float m_CameraPitch = 0.0f;
 	float m_VerticalFov = 45.0f;
+	float m_Exposure = 1.0f;
 };
 
 Walnut::Application* Walnut::CreateApplication(int argc, char** argv)

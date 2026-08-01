@@ -16,7 +16,8 @@ namespace
 		glm::vec4 CameraForward;
 		uint32_t FrameIndex;
 		float VerticalFov;
-		glm::vec2 Padding;
+		float Exposure;
+		float Padding;
 	};
 
 	static_assert(sizeof(PushConstants) == 48);
@@ -308,6 +309,7 @@ void ComputeRenderer::Render()
 	pushConstants.CameraForward = glm::vec4(m_CameraForward, 0.0f);
 	pushConstants.FrameIndex = m_FrameIndex;
 	pushConstants.VerticalFov = m_VerticalFov;
+	pushConstants.Exposure = m_Exposure;
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
