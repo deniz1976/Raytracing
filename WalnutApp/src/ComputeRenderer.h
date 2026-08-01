@@ -34,6 +34,7 @@ private:
 		VkDeviceMemory& memory,
 		VkImageView& imageView);
 	void CreateOutputImages();
+	void CreateSceneBuffer();
 	void CreateComputeDescriptors();
 	void CreateComputePipeline(const std::string& shaderPath);
 	void Release();
@@ -46,6 +47,10 @@ private:
 	glm::vec3 m_CameraForward = { 0.0f, 0.0f, -1.0f };
 	float m_VerticalFov = 45.0f;
 	float m_Exposure = 1.0f;
+	uint32_t m_SphereCount = 0;
+
+	VkBuffer m_SphereBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_SphereBufferMemory = VK_NULL_HANDLE;
 
 	VkImage m_OutputImage = VK_NULL_HANDLE;
 	VkDeviceMemory m_OutputImageMemory = VK_NULL_HANDLE;

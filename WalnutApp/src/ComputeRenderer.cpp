@@ -4,6 +4,8 @@
 
 #include "backends/imgui_impl_vulkan.h"
 
+#include <array>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <vector>
@@ -17,10 +19,19 @@ namespace
 		uint32_t FrameIndex;
 		float VerticalFov;
 		float Exposure;
-		float Padding;
+		uint32_t SphereCount;
 	};
 
 	static_assert(sizeof(PushConstants) == 48);
+
+	struct alignas(16) GpuSphere
+	{
+		glm::vec4 CenterRadius;
+		glm::vec4 AlbedoReflectivity;
+		glm::vec4 RoughnessPadding;
+	};
+
+	static_assert(sizeof(GpuSphere) == 48);
 
 	std::vector<uint32_t> ReadShaderFile(const std::string& path)
 	{
@@ -51,8 +62,70 @@ void ComputeRenderer::Init(const std::string& shaderPath, uint32_t width, uint32
 	m_FrameIndex = 0;
 
 	CreateOutputImages();
+	CreateSceneBuffer();
 	CreateComputeDescriptors();
 	CreateComputePipeline(shaderPath);
+}
+
+void ComputeRenderer::CreateSceneBuffer()
+{
+	const std::array<GpuSphere, 4> spheres = {
+		GpuSphere{
+			{ 0.0f, 0.0f, 0.0f, 1.0f },
+			{ 0.85f, 0.18f, 0.12f, 0.15f },
+			{ 0.65f, 0.0f, 0.0f, 0.0f } },
+		GpuSphere{
+			{ -2.1f, 0.0f, -1.0f, 1.0f },
+			{ 0.12f, 0.35f, 0.85f, 0.75f },
+			{ 0.05f, 0.0f, 0.0f, 0.0f } },
+		GpuSphere{
+			{ 2.1f, 0.0f, -1.0f, 1.0f },
+			{ 0.15f, 0.75f, 0.28f, 0.35f },
+			{ 0.35f, 0.0f, 0.0f, 0.0f } },
+		GpuSphere{
+			{ 0.0f, -101.0f, 0.0f, 100.0f },
+			{ 0.55f, 0.55f, 0.55f, 0.15f },
+			{ 0.55f, 0.0f, 0.0f, 0.0f } }
+	};
+
+	m_SphereCount = static_cast<uint32_t>(spheres.size());
+	const VkDeviceSize bufferSize = sizeof(spheres);
+	VkDevice device = Walnut::Application::GetDevice();
+
+	VkBufferCreateInfo bufferInfo{};
+	bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	bufferInfo.size = bufferSize;
+	bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+	bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	check_vk_result(vkCreateBuffer(
+		device, &bufferInfo, nullptr, &m_SphereBuffer));
+
+	VkMemoryRequirements memoryRequirements;
+	vkGetBufferMemoryRequirements(
+		device, m_SphereBuffer, &memoryRequirements);
+
+	VkMemoryAllocateInfo allocationInfo{};
+	allocationInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocationInfo.allocationSize = memoryRequirements.size;
+	allocationInfo.memoryTypeIndex = FindMemoryType(
+		memoryRequirements.memoryTypeBits,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+			VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	check_vk_result(vkAllocateMemory(
+		device, &allocationInfo, nullptr, &m_SphereBufferMemory));
+	check_vk_result(vkBindBufferMemory(
+		device, m_SphereBuffer, m_SphereBufferMemory, 0));
+
+	void* mappedMemory = nullptr;
+	check_vk_result(vkMapMemory(
+		device,
+		m_SphereBufferMemory,
+		0,
+		bufferSize,
+		0,
+		&mappedMemory));
+	std::memcpy(mappedMemory, spheres.data(), static_cast<size_t>(bufferSize));
+	vkUnmapMemory(device, m_SphereBufferMemory);
 }
 
 uint32_t ComputeRenderer::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const
@@ -203,31 +276,37 @@ void ComputeRenderer::CreateComputeDescriptors()
 {
 	VkDevice device = Walnut::Application::GetDevice();
 
-	VkDescriptorSetLayoutBinding imageBindings[2]{};
+	VkDescriptorSetLayoutBinding descriptorBindings[3]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
-		imageBindings[bindingIndex].binding = bindingIndex;
-		imageBindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-		imageBindings[bindingIndex].descriptorCount = 1;
-		imageBindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+		descriptorBindings[bindingIndex].binding = bindingIndex;
+		descriptorBindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		descriptorBindings[bindingIndex].descriptorCount = 1;
+		descriptorBindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 	}
+	descriptorBindings[2].binding = 2;
+	descriptorBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	descriptorBindings[2].descriptorCount = 1;
+	descriptorBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 2;
-	layoutInfo.pBindings = imageBindings;
+	layoutInfo.bindingCount = 3;
+	layoutInfo.pBindings = descriptorBindings;
 	check_vk_result(vkCreateDescriptorSetLayout(
 		device, &layoutInfo, nullptr, &m_ComputeDescriptorSetLayout));
 
-	VkDescriptorPoolSize poolSize{};
-	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	poolSize.descriptorCount = 2;
+	VkDescriptorPoolSize poolSizes[2]{};
+	poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+	poolSizes[0].descriptorCount = 2;
+	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	poolSizes[1].descriptorCount = 1;
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.maxSets = 1;
-	poolInfo.poolSizeCount = 1;
-	poolInfo.pPoolSizes = &poolSize;
+	poolInfo.poolSizeCount = 2;
+	poolInfo.pPoolSizes = poolSizes;
 	check_vk_result(vkCreateDescriptorPool(
 		device, &poolInfo, nullptr, &m_ComputeDescriptorPool));
 
@@ -244,8 +323,12 @@ void ComputeRenderer::CreateComputeDescriptors()
 	descriptorImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 	descriptorImages[1].imageView = m_AccumulationImageView;
 	descriptorImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+	VkDescriptorBufferInfo descriptorBuffer{};
+	descriptorBuffer.buffer = m_SphereBuffer;
+	descriptorBuffer.offset = 0;
+	descriptorBuffer.range = VK_WHOLE_SIZE;
 
-	VkWriteDescriptorSet descriptorWrites[2]{};
+	VkWriteDescriptorSet descriptorWrites[3]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorWrites[bindingIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -255,7 +338,13 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorWrites[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 		descriptorWrites[bindingIndex].pImageInfo = &descriptorImages[bindingIndex];
 	}
-	vkUpdateDescriptorSets(device, 2, descriptorWrites, 0, nullptr);
+	descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	descriptorWrites[2].dstSet = m_ComputeDescriptorSet;
+	descriptorWrites[2].dstBinding = 2;
+	descriptorWrites[2].descriptorCount = 1;
+	descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	descriptorWrites[2].pBufferInfo = &descriptorBuffer;
+	vkUpdateDescriptorSets(device, 3, descriptorWrites, 0, nullptr);
 }
 
 void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)
@@ -310,6 +399,7 @@ void ComputeRenderer::Render()
 	pushConstants.FrameIndex = m_FrameIndex;
 	pushConstants.VerticalFov = m_VerticalFov;
 	pushConstants.Exposure = m_Exposure;
+	pushConstants.SphereCount = m_SphereCount;
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
@@ -387,11 +477,14 @@ void ComputeRenderer::Release()
 	VkImageView accumulationImageView = m_AccumulationImageView;
 	VkImage accumulationImage = m_AccumulationImage;
 	VkDeviceMemory accumulationImageMemory = m_AccumulationImageMemory;
+	VkBuffer sphereBuffer = m_SphereBuffer;
+	VkDeviceMemory sphereBufferMemory = m_SphereBufferMemory;
 
 	Walnut::Application::SubmitResourceFree(
 		[pipeline, pipelineLayout, descriptorPool, descriptorSetLayout,
 		 sampler, outputImageView, outputImage, outputImageMemory,
-		 accumulationImageView, accumulationImage, accumulationImageMemory]()
+		 accumulationImageView, accumulationImage, accumulationImageMemory,
+		 sphereBuffer, sphereBufferMemory]()
 		{
 			VkDevice device = Walnut::Application::GetDevice();
 			vkDestroyPipeline(device, pipeline, nullptr);
@@ -405,6 +498,8 @@ void ComputeRenderer::Release()
 			vkDestroyImageView(device, accumulationImageView, nullptr);
 			vkDestroyImage(device, accumulationImage, nullptr);
 			vkFreeMemory(device, accumulationImageMemory, nullptr);
+			vkDestroyBuffer(device, sphereBuffer, nullptr);
+			vkFreeMemory(device, sphereBufferMemory, nullptr);
 		});
 
 	m_OutputImage = VK_NULL_HANDLE;
