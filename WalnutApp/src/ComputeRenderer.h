@@ -42,6 +42,8 @@ public:
 	void SetSphere(uint32_t index, const Sphere& sphere);
 	bool AddSphere();
 	bool RemoveSphere(uint32_t index);
+	bool SaveScene(const std::string& path, std::string& errorMessage) const;
+	bool LoadScene(const std::string& path, std::string& errorMessage);
 	const AreaLight& GetAreaLight() const { return m_AreaLight; }
 	void SetAreaLight(const AreaLight& light);
 	void ResetAccumulation();

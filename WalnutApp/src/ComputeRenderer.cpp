@@ -6,8 +6,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -36,6 +40,66 @@ namespace
 	};
 
 	static_assert(sizeof(GpuSphere) == 48);
+
+	ComputeRenderer::Sphere SanitizeSphere(
+		const ComputeRenderer::Sphere& sphere)
+	{
+		ComputeRenderer::Sphere result = sphere;
+		result.Radius = std::clamp(result.Radius, 0.05f, 200.0f);
+		result.Albedo = glm::clamp(
+			result.Albedo,
+			glm::vec3(0.0f),
+			glm::vec3(1.0f));
+		result.Reflectivity =
+			std::clamp(result.Reflectivity, 0.0f, 1.0f);
+		result.Roughness =
+			std::clamp(result.Roughness, 0.0f, 1.0f);
+		return result;
+	}
+
+	ComputeRenderer::AreaLight SanitizeAreaLight(
+		const ComputeRenderer::AreaLight& light)
+	{
+		ComputeRenderer::AreaLight result = light;
+		result.Color = glm::clamp(
+			result.Color,
+			glm::vec3(0.0f),
+			glm::vec3(1.0f));
+		result.Size = glm::clamp(
+			result.Size,
+			glm::vec2(0.05f),
+			glm::vec2(20.0f));
+		result.Intensity = std::clamp(result.Intensity, 0.0f, 100.0f);
+		return result;
+	}
+
+	bool IsFinite(const ComputeRenderer::Sphere& sphere)
+	{
+		return
+			std::isfinite(sphere.Center.x) &&
+			std::isfinite(sphere.Center.y) &&
+			std::isfinite(sphere.Center.z) &&
+			std::isfinite(sphere.Radius) &&
+			std::isfinite(sphere.Albedo.r) &&
+			std::isfinite(sphere.Albedo.g) &&
+			std::isfinite(sphere.Albedo.b) &&
+			std::isfinite(sphere.Reflectivity) &&
+			std::isfinite(sphere.Roughness);
+	}
+
+	bool IsFinite(const ComputeRenderer::AreaLight& light)
+	{
+		return
+			std::isfinite(light.Position.x) &&
+			std::isfinite(light.Position.y) &&
+			std::isfinite(light.Position.z) &&
+			std::isfinite(light.Color.r) &&
+			std::isfinite(light.Color.g) &&
+			std::isfinite(light.Color.b) &&
+			std::isfinite(light.Size.x) &&
+			std::isfinite(light.Size.y) &&
+			std::isfinite(light.Intensity);
+	}
 
 	std::vector<uint32_t> ReadShaderFile(const std::string& path)
 	{
@@ -169,18 +233,7 @@ const ComputeRenderer::Sphere& ComputeRenderer::GetSphere(uint32_t index) const
 
 void ComputeRenderer::SetSphere(uint32_t index, const Sphere& sphere)
 {
-	Sphere sanitizedSphere = sphere;
-	sanitizedSphere.Radius = std::clamp(sanitizedSphere.Radius, 0.05f, 200.0f);
-	sanitizedSphere.Albedo = glm::clamp(
-		sanitizedSphere.Albedo,
-		glm::vec3(0.0f),
-		glm::vec3(1.0f));
-	sanitizedSphere.Reflectivity =
-		std::clamp(sanitizedSphere.Reflectivity, 0.0f, 1.0f);
-	sanitizedSphere.Roughness =
-		std::clamp(sanitizedSphere.Roughness, 0.0f, 1.0f);
-
-	m_Spheres.at(index) = sanitizedSphere;
+	m_Spheres.at(index) = SanitizeSphere(sphere);
 	UploadSceneBuffer();
 	ResetAccumulation();
 }
@@ -213,21 +266,170 @@ bool ComputeRenderer::RemoveSphere(uint32_t index)
 	return true;
 }
 
+bool ComputeRenderer::SaveScene(
+	const std::string& path,
+	std::string& errorMessage) const
+{
+	errorMessage.clear();
+	const std::filesystem::path scenePath(path);
+	if (scenePath.has_parent_path())
+	{
+		std::error_code directoryError;
+		std::filesystem::create_directories(
+			scenePath.parent_path(),
+			directoryError);
+		if (directoryError)
+		{
+			errorMessage = "Scene directory could not be created.";
+			return false;
+		}
+	}
+
+	std::ofstream file(scenePath, std::ios::trunc);
+	if (!file)
+	{
+		errorMessage = "Scene file could not be opened for writing.";
+		return false;
+	}
+
+	file << std::setprecision(std::numeric_limits<float>::max_digits10);
+	file << "WALNUT_RAY_SCENE 1\n";
+	file << "SPHERE_COUNT " << m_Spheres.size() << '\n';
+	for (const Sphere& sphere : m_Spheres)
+	{
+		file << "SPHERE "
+			<< sphere.Center.x << ' '
+			<< sphere.Center.y << ' '
+			<< sphere.Center.z << ' '
+			<< sphere.Radius << ' '
+			<< sphere.Albedo.r << ' '
+			<< sphere.Albedo.g << ' '
+			<< sphere.Albedo.b << ' '
+			<< sphere.Reflectivity << ' '
+			<< sphere.Roughness << '\n';
+	}
+	file << "LIGHT "
+		<< m_AreaLight.Position.x << ' '
+		<< m_AreaLight.Position.y << ' '
+		<< m_AreaLight.Position.z << ' '
+		<< m_AreaLight.Color.r << ' '
+		<< m_AreaLight.Color.g << ' '
+		<< m_AreaLight.Color.b << ' '
+		<< m_AreaLight.Size.x << ' '
+		<< m_AreaLight.Size.y << ' '
+		<< m_AreaLight.Intensity << '\n';
+	file.flush();
+
+	if (!file)
+	{
+		errorMessage = "Scene file could not be written completely.";
+		return false;
+	}
+
+	return true;
+}
+
+bool ComputeRenderer::LoadScene(
+	const std::string& path,
+	std::string& errorMessage)
+{
+	errorMessage.clear();
+	std::ifstream file(path);
+	if (!file)
+	{
+		errorMessage = "Scene file could not be opened.";
+		return false;
+	}
+
+	std::string label;
+	uint32_t version = 0;
+	if (!(file >> label >> version) ||
+		label != "WALNUT_RAY_SCENE" ||
+		version != 1)
+	{
+		errorMessage = "Scene header or version is invalid.";
+		return false;
+	}
+
+	uint64_t sphereCount = 0;
+	if (!(file >> label >> sphereCount) || label != "SPHERE_COUNT")
+	{
+		errorMessage = "Sphere count is missing or invalid.";
+		return false;
+	}
+	if (sphereCount > MaxSphereCount)
+	{
+		errorMessage = "Scene exceeds the sphere capacity.";
+		return false;
+	}
+
+	std::vector<Sphere> loadedSpheres;
+	loadedSpheres.reserve(static_cast<size_t>(sphereCount));
+	for (uint64_t sphereIndex = 0; sphereIndex < sphereCount; sphereIndex++)
+	{
+		Sphere sphere{};
+		if (!(file >> label) || label != "SPHERE" ||
+			!(file
+				>> sphere.Center.x
+				>> sphere.Center.y
+				>> sphere.Center.z
+				>> sphere.Radius
+				>> sphere.Albedo.r
+				>> sphere.Albedo.g
+				>> sphere.Albedo.b
+				>> sphere.Reflectivity
+				>> sphere.Roughness))
+		{
+			errorMessage = "Sphere data is missing or invalid.";
+			return false;
+		}
+		if (!IsFinite(sphere))
+		{
+			errorMessage = "Sphere data contains a non-finite number.";
+			return false;
+		}
+		loadedSpheres.push_back(SanitizeSphere(sphere));
+	}
+
+	AreaLight loadedLight{};
+	if (!(file >> label) || label != "LIGHT" ||
+		!(file
+			>> loadedLight.Position.x
+			>> loadedLight.Position.y
+			>> loadedLight.Position.z
+			>> loadedLight.Color.r
+			>> loadedLight.Color.g
+			>> loadedLight.Color.b
+			>> loadedLight.Size.x
+			>> loadedLight.Size.y
+			>> loadedLight.Intensity))
+	{
+		errorMessage = "Area light data is missing or invalid.";
+		return false;
+	}
+	if (!IsFinite(loadedLight))
+	{
+		errorMessage = "Area light data contains a non-finite number.";
+		return false;
+	}
+
+	std::string unexpectedData;
+	if (file >> unexpectedData)
+	{
+		errorMessage = "Scene file contains unexpected trailing data.";
+		return false;
+	}
+
+	m_Spheres = std::move(loadedSpheres);
+	m_AreaLight = SanitizeAreaLight(loadedLight);
+	UploadSceneBuffer();
+	ResetAccumulation();
+	return true;
+}
+
 void ComputeRenderer::SetAreaLight(const AreaLight& light)
 {
-	AreaLight sanitizedLight = light;
-	sanitizedLight.Color = glm::clamp(
-		sanitizedLight.Color,
-		glm::vec3(0.0f),
-		glm::vec3(1.0f));
-	sanitizedLight.Size = glm::clamp(
-		sanitizedLight.Size,
-		glm::vec2(0.05f),
-		glm::vec2(20.0f));
-	sanitizedLight.Intensity =
-		std::clamp(sanitizedLight.Intensity, 0.0f, 100.0f);
-
-	m_AreaLight = sanitizedLight;
+	m_AreaLight = SanitizeAreaLight(light);
 	ResetAccumulation();
 }
 

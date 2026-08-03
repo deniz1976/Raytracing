@@ -5,6 +5,14 @@
 
 #include <glm/gtc/constants.hpp>
 
+#include <string>
+
+namespace
+{
+	constexpr const char* SceneFilePath =
+		"assets/scenes/CurrentScene.local.scene";
+}
+
 class ExampleLayer : public Walnut::Layer
 {
 public:
@@ -62,6 +70,40 @@ public:
 		ImGui::End();
 
 		ImGui::Begin("Scene Controls");
+		if (ImGui::Button("Save Scene"))
+		{
+			std::string errorMessage;
+			if (m_Renderer.SaveScene(SceneFilePath, errorMessage))
+				m_SceneStatus = "Scene saved.";
+			else
+				m_SceneStatus = "Save failed: " + errorMessage;
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Load Scene"))
+		{
+			std::string errorMessage;
+			if (m_Renderer.LoadScene(SceneFilePath, errorMessage))
+			{
+				m_SceneStatus = "Scene loaded.";
+				const uint32_t loadedSphereCount = m_Renderer.GetSphereCount();
+				if (loadedSphereCount == 0)
+					m_SelectedSphereIndex = 0;
+				else if (m_SelectedSphereIndex >=
+					static_cast<int>(loadedSphereCount))
+				{
+					m_SelectedSphereIndex =
+						static_cast<int>(loadedSphereCount) - 1;
+				}
+			}
+			else
+			{
+				m_SceneStatus = "Load failed: " + errorMessage;
+			}
+		}
+
+		if (!m_SceneStatus.empty())
+			ImGui::TextWrapped("%s", m_SceneStatus.c_str());
+
 		uint32_t sphereCount = m_Renderer.GetSphereCount();
 		ImGui::Text(
 			"Spheres: %u / %u",
@@ -208,6 +250,7 @@ private:
 	float m_VerticalFov = 45.0f;
 	float m_Exposure = 1.0f;
 	int m_SelectedSphereIndex = 0;
+	std::string m_SceneStatus;
 };
 
 Walnut::Application* Walnut::CreateApplication(int argc, char** argv)
