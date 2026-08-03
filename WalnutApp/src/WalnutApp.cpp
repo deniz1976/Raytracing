@@ -62,44 +62,81 @@ public:
 		ImGui::End();
 
 		ImGui::Begin("Scene Controls");
-		ImGui::SliderInt(
-			"Sphere Index",
-			&m_SelectedSphereIndex,
-			0,
-			static_cast<int>(ComputeRenderer::SphereCount) - 1);
+		uint32_t sphereCount = m_Renderer.GetSphereCount();
+		ImGui::Text(
+			"Spheres: %u / %u",
+			sphereCount,
+			ComputeRenderer::MaxSphereCount);
 
-		ComputeRenderer::Sphere sphere = m_Renderer.GetSphere(
-			static_cast<uint32_t>(m_SelectedSphereIndex));
-		bool sphereChanged = false;
-		sphereChanged |= ImGui::DragFloat3(
-			"Center",
-			&sphere.Center.x,
-			0.05f);
-		sphereChanged |= ImGui::DragFloat(
-			"Radius",
-			&sphere.Radius,
-			0.05f,
-			0.05f,
-			200.0f);
-		sphereChanged |= ImGui::ColorEdit3(
-			"Albedo",
-			&sphere.Albedo.x);
-		sphereChanged |= ImGui::SliderFloat(
-			"Reflectivity",
-			&sphere.Reflectivity,
-			0.0f,
-			1.0f);
-		sphereChanged |= ImGui::SliderFloat(
-			"Roughness",
-			&sphere.Roughness,
-			0.0f,
-			1.0f);
-
-		if (sphereChanged)
+		if (sphereCount < ComputeRenderer::MaxSphereCount &&
+			ImGui::Button("Add Sphere"))
 		{
-			m_Renderer.SetSphere(
-				static_cast<uint32_t>(m_SelectedSphereIndex),
-				sphere);
+			if (m_Renderer.AddSphere())
+				m_SelectedSphereIndex =
+					static_cast<int>(m_Renderer.GetSphereCount()) - 1;
+		}
+
+		sphereCount = m_Renderer.GetSphereCount();
+		if (sphereCount > 0)
+		{
+			ImGui::SameLine();
+			if (ImGui::Button("Remove Selected"))
+			{
+				m_Renderer.RemoveSphere(
+					static_cast<uint32_t>(m_SelectedSphereIndex));
+				sphereCount = m_Renderer.GetSphereCount();
+				if (sphereCount == 0)
+					m_SelectedSphereIndex = 0;
+				else if (m_SelectedSphereIndex >= static_cast<int>(sphereCount))
+					m_SelectedSphereIndex = static_cast<int>(sphereCount) - 1;
+			}
+		}
+
+		if (sphereCount == 0)
+		{
+			ImGui::Text("No spheres in the scene.");
+		}
+		else
+		{
+			ImGui::SliderInt(
+				"Sphere Index",
+				&m_SelectedSphereIndex,
+				0,
+				static_cast<int>(sphereCount) - 1);
+
+			ComputeRenderer::Sphere sphere = m_Renderer.GetSphere(
+				static_cast<uint32_t>(m_SelectedSphereIndex));
+			bool sphereChanged = false;
+			sphereChanged |= ImGui::DragFloat3(
+				"Center",
+				&sphere.Center.x,
+				0.05f);
+			sphereChanged |= ImGui::DragFloat(
+				"Radius",
+				&sphere.Radius,
+				0.05f,
+				0.05f,
+				200.0f);
+			sphereChanged |= ImGui::ColorEdit3(
+				"Albedo",
+				&sphere.Albedo.x);
+			sphereChanged |= ImGui::SliderFloat(
+				"Reflectivity",
+				&sphere.Reflectivity,
+				0.0f,
+				1.0f);
+			sphereChanged |= ImGui::SliderFloat(
+				"Roughness",
+				&sphere.Roughness,
+				0.0f,
+				1.0f);
+
+			if (sphereChanged)
+			{
+				m_Renderer.SetSphere(
+					static_cast<uint32_t>(m_SelectedSphereIndex),
+					sphere);
+			}
 		}
 
 		ImGui::End();

@@ -1,8 +1,8 @@
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <glm/glm.hpp>
 #include <vulkan/vulkan.h>
@@ -27,7 +27,7 @@ public:
 		float Intensity;
 	};
 
-	static constexpr uint32_t SphereCount = 4;
+	static constexpr uint32_t MaxSphereCount = 64;
 
 	~ComputeRenderer();
 
@@ -40,6 +40,8 @@ public:
 	void SetExposure(float exposure) { m_Exposure = exposure; }
 	const Sphere& GetSphere(uint32_t index) const;
 	void SetSphere(uint32_t index, const Sphere& sphere);
+	bool AddSphere();
+	bool RemoveSphere(uint32_t index);
 	const AreaLight& GetAreaLight() const { return m_AreaLight; }
 	void SetAreaLight(const AreaLight& light);
 	void ResetAccumulation();
@@ -48,6 +50,7 @@ public:
 	uint32_t GetWidth() const { return m_Width; }
 	uint32_t GetHeight() const { return m_Height; }
 	uint32_t GetFrameIndex() const { return m_FrameIndex; }
+	uint32_t GetSphereCount() const { return static_cast<uint32_t>(m_Spheres.size()); }
 
 private:
 	uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
@@ -72,7 +75,7 @@ private:
 	glm::vec3 m_CameraForward = { 0.0f, 0.0f, -1.0f };
 	float m_VerticalFov = 45.0f;
 	float m_Exposure = 1.0f;
-	std::array<Sphere, SphereCount> m_Spheres{};
+	std::vector<Sphere> m_Spheres;
 	AreaLight m_AreaLight = {
 		{ -2.5f, 5.0f, 2.0f },
 		{ 1.0f, 0.95f, 0.85f },

@@ -5,6 +5,7 @@
 #include "backends/imgui_impl_vulkan.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -99,7 +100,7 @@ void ComputeRenderer::CreateSceneBuffer()
 			0.55f }
 	};
 
-	const VkDeviceSize bufferSize = sizeof(GpuSphere) * m_Spheres.size();
+	const VkDeviceSize bufferSize = sizeof(GpuSphere) * MaxSphereCount;
 	VkDevice device = Walnut::Application::GetDevice();
 
 	VkBufferCreateInfo bufferInfo{};
@@ -131,7 +132,7 @@ void ComputeRenderer::CreateSceneBuffer()
 
 void ComputeRenderer::UploadSceneBuffer()
 {
-	std::array<GpuSphere, SphereCount> gpuSpheres{};
+	std::array<GpuSphere, MaxSphereCount> gpuSpheres{};
 	for (size_t sphereIndex = 0; sphereIndex < m_Spheres.size(); sphereIndex++)
 	{
 		const Sphere& sphere = m_Spheres[sphereIndex];
@@ -182,6 +183,34 @@ void ComputeRenderer::SetSphere(uint32_t index, const Sphere& sphere)
 	m_Spheres.at(index) = sanitizedSphere;
 	UploadSceneBuffer();
 	ResetAccumulation();
+}
+
+bool ComputeRenderer::AddSphere()
+{
+	if (m_Spheres.size() >= MaxSphereCount)
+		return false;
+
+	m_Spheres.push_back({
+		{ 0.0f, 0.0f, -3.0f },
+		1.0f,
+		{ 0.8f, 0.6f, 0.2f },
+		0.1f,
+		0.5f
+	});
+	UploadSceneBuffer();
+	ResetAccumulation();
+	return true;
+}
+
+bool ComputeRenderer::RemoveSphere(uint32_t index)
+{
+	if (index >= m_Spheres.size())
+		return false;
+
+	m_Spheres.erase(m_Spheres.begin() + index);
+	UploadSceneBuffer();
+	ResetAccumulation();
+	return true;
 }
 
 void ComputeRenderer::SetAreaLight(const AreaLight& light)
@@ -473,7 +502,7 @@ void ComputeRenderer::Render()
 	pushConstants.FrameIndex = m_FrameIndex;
 	pushConstants.VerticalFov = m_VerticalFov;
 	pushConstants.Exposure = m_Exposure;
-	pushConstants.SphereCount = SphereCount;
+	pushConstants.SphereCount = GetSphereCount();
 	pushConstants.LightPositionIntensity = glm::vec4(
 		m_AreaLight.Position,
 		m_AreaLight.Intensity);
