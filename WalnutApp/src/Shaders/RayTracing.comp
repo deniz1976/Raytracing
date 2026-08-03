@@ -25,6 +25,9 @@ layout(push_constant) uniform PushConstants
 	float VerticalFov;
 	float Exposure;
 	uint SphereCount;
+	vec4 LightPositionIntensity;
+	vec4 LightColor;
+	vec4 LightSizePadding;
 } u_PushConstants;
 
 const int MAX_BOUNCES = 3;
@@ -351,10 +354,10 @@ void main()
 			fieldOfViewScale);
 
 	AreaLight light;
-	light.Position = vec3(-2.5, 5.0, 2.0);
-	light.Color = vec3(1.0, 0.95, 0.85);
-	light.Size = vec2(3.0, 3.0);
-	light.Intensity = 24.0;
+	light.Position = u_PushConstants.LightPositionIntensity.xyz;
+	light.Intensity = u_PushConstants.LightPositionIntensity.w;
+	light.Color = u_PushConstants.LightColor.xyz;
+	light.Size = u_PushConstants.LightSizePadding.xy;
 
 	uint pathSeed = frameSeed ^ 0xa511e9b3u;
 	vec3 sampleColor = TraceRay(ray, light, pathSeed);

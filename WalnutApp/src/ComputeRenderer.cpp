@@ -20,9 +20,12 @@ namespace
 		float VerticalFov;
 		float Exposure;
 		uint32_t SphereCount;
+		glm::vec4 LightPositionIntensity;
+		glm::vec4 LightColor;
+		glm::vec4 LightSizePadding;
 	};
 
-	static_assert(sizeof(PushConstants) == 48);
+	static_assert(sizeof(PushConstants) == 96);
 
 	struct alignas(16) GpuSphere
 	{
@@ -178,6 +181,24 @@ void ComputeRenderer::SetSphere(uint32_t index, const Sphere& sphere)
 
 	m_Spheres.at(index) = sanitizedSphere;
 	UploadSceneBuffer();
+	ResetAccumulation();
+}
+
+void ComputeRenderer::SetAreaLight(const AreaLight& light)
+{
+	AreaLight sanitizedLight = light;
+	sanitizedLight.Color = glm::clamp(
+		sanitizedLight.Color,
+		glm::vec3(0.0f),
+		glm::vec3(1.0f));
+	sanitizedLight.Size = glm::clamp(
+		sanitizedLight.Size,
+		glm::vec2(0.05f),
+		glm::vec2(20.0f));
+	sanitizedLight.Intensity =
+		std::clamp(sanitizedLight.Intensity, 0.0f, 100.0f);
+
+	m_AreaLight = sanitizedLight;
 	ResetAccumulation();
 }
 
@@ -453,6 +474,11 @@ void ComputeRenderer::Render()
 	pushConstants.VerticalFov = m_VerticalFov;
 	pushConstants.Exposure = m_Exposure;
 	pushConstants.SphereCount = SphereCount;
+	pushConstants.LightPositionIntensity = glm::vec4(
+		m_AreaLight.Position,
+		m_AreaLight.Intensity);
+	pushConstants.LightColor = glm::vec4(m_AreaLight.Color, 0.0f);
+	pushConstants.LightSizePadding = glm::vec4(m_AreaLight.Size, 0.0f, 0.0f);
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 

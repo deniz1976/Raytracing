@@ -104,6 +104,34 @@ public:
 
 		ImGui::End();
 
+		ImGui::Begin("Light Controls");
+		ComputeRenderer::AreaLight light = m_Renderer.GetAreaLight();
+		bool lightChanged = false;
+		lightChanged |= ImGui::DragFloat3(
+			"Position",
+			&light.Position.x,
+			0.05f);
+		lightChanged |= ImGui::ColorEdit3(
+			"Color",
+			&light.Color.x);
+		lightChanged |= ImGui::DragFloat2(
+			"Size",
+			&light.Size.x,
+			0.05f,
+			0.05f,
+			20.0f);
+		lightChanged |= ImGui::DragFloat(
+			"Intensity",
+			&light.Intensity,
+			0.1f,
+			0.0f,
+			100.0f);
+
+		if (lightChanged)
+			m_Renderer.SetAreaLight(light);
+
+		ImGui::End();
+
 		m_Renderer.Render();
 
 		ImGui::Begin("Compute Shader Output");

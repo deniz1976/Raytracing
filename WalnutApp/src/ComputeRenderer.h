@@ -19,6 +19,14 @@ public:
 		float Roughness;
 	};
 
+	struct AreaLight
+	{
+		glm::vec3 Position;
+		glm::vec3 Color;
+		glm::vec2 Size;
+		float Intensity;
+	};
+
 	static constexpr uint32_t SphereCount = 4;
 
 	~ComputeRenderer();
@@ -32,6 +40,8 @@ public:
 	void SetExposure(float exposure) { m_Exposure = exposure; }
 	const Sphere& GetSphere(uint32_t index) const;
 	void SetSphere(uint32_t index, const Sphere& sphere);
+	const AreaLight& GetAreaLight() const { return m_AreaLight; }
+	void SetAreaLight(const AreaLight& light);
 	void ResetAccumulation();
 
 	VkDescriptorSet GetImageDescriptorSet() const { return m_ImGuiDescriptorSet; }
@@ -63,6 +73,12 @@ private:
 	float m_VerticalFov = 45.0f;
 	float m_Exposure = 1.0f;
 	std::array<Sphere, SphereCount> m_Spheres{};
+	AreaLight m_AreaLight = {
+		{ -2.5f, 5.0f, 2.0f },
+		{ 1.0f, 0.95f, 0.85f },
+		{ 3.0f, 3.0f },
+		24.0f
+	};
 
 	VkBuffer m_SphereBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_SphereBufferMemory = VK_NULL_HANDLE;
