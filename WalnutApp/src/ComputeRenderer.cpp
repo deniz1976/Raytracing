@@ -4,7 +4,7 @@
 
 #include "backends/imgui_impl_vulkan.h"
 
-#include <array>
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -69,27 +69,34 @@ void ComputeRenderer::Init(const std::string& shaderPath, uint32_t width, uint32
 
 void ComputeRenderer::CreateSceneBuffer()
 {
-	const std::array<GpuSphere, 4> spheres = {
-		GpuSphere{
-			{ 0.0f, 0.0f, 0.0f, 1.0f },
-			{ 0.85f, 0.18f, 0.12f, 0.15f },
-			{ 0.65f, 0.0f, 0.0f, 0.0f } },
-		GpuSphere{
-			{ -2.1f, 0.0f, -1.0f, 1.0f },
-			{ 0.12f, 0.35f, 0.85f, 0.75f },
-			{ 0.05f, 0.0f, 0.0f, 0.0f } },
-		GpuSphere{
-			{ 2.1f, 0.0f, -1.0f, 1.0f },
-			{ 0.15f, 0.75f, 0.28f, 0.35f },
-			{ 0.35f, 0.0f, 0.0f, 0.0f } },
-		GpuSphere{
-			{ 0.0f, -101.0f, 0.0f, 100.0f },
-			{ 0.55f, 0.55f, 0.55f, 0.15f },
-			{ 0.55f, 0.0f, 0.0f, 0.0f } }
+	m_Spheres = {
+		Sphere{
+			{ 0.0f, 0.0f, 0.0f },
+			1.0f,
+			{ 0.85f, 0.18f, 0.12f },
+			0.15f,
+			0.65f },
+		Sphere{
+			{ -2.1f, 0.0f, -1.0f },
+			1.0f,
+			{ 0.12f, 0.35f, 0.85f },
+			0.75f,
+			0.05f },
+		Sphere{
+			{ 2.1f, 0.0f, -1.0f },
+			1.0f,
+			{ 0.15f, 0.75f, 0.28f },
+			0.35f,
+			0.35f },
+		Sphere{
+			{ 0.0f, -101.0f, 0.0f },
+			100.0f,
+			{ 0.55f, 0.55f, 0.55f },
+			0.15f,
+			0.55f }
 	};
 
-	m_SphereCount = static_cast<uint32_t>(spheres.size());
-	const VkDeviceSize bufferSize = sizeof(spheres);
+	const VkDeviceSize bufferSize = sizeof(GpuSphere) * m_Spheres.size();
 	VkDevice device = Walnut::Application::GetDevice();
 
 	VkBufferCreateInfo bufferInfo{};
@@ -116,6 +123,26 @@ void ComputeRenderer::CreateSceneBuffer()
 	check_vk_result(vkBindBufferMemory(
 		device, m_SphereBuffer, m_SphereBufferMemory, 0));
 
+	UploadSceneBuffer();
+}
+
+void ComputeRenderer::UploadSceneBuffer()
+{
+	std::array<GpuSphere, SphereCount> gpuSpheres{};
+	for (size_t sphereIndex = 0; sphereIndex < m_Spheres.size(); sphereIndex++)
+	{
+		const Sphere& sphere = m_Spheres[sphereIndex];
+		gpuSpheres[sphereIndex].CenterRadius =
+			glm::vec4(sphere.Center, sphere.Radius);
+		gpuSpheres[sphereIndex].AlbedoReflectivity =
+			glm::vec4(sphere.Albedo, sphere.Reflectivity);
+		gpuSpheres[sphereIndex].RoughnessPadding =
+			glm::vec4(sphere.Roughness, 0.0f, 0.0f, 0.0f);
+	}
+
+	const VkDeviceSize bufferSize = sizeof(gpuSpheres);
+	VkDevice device = Walnut::Application::GetDevice();
+
 	void* mappedMemory = nullptr;
 	check_vk_result(vkMapMemory(
 		device,
@@ -124,8 +151,34 @@ void ComputeRenderer::CreateSceneBuffer()
 		bufferSize,
 		0,
 		&mappedMemory));
-	std::memcpy(mappedMemory, spheres.data(), static_cast<size_t>(bufferSize));
+	std::memcpy(
+		mappedMemory,
+		gpuSpheres.data(),
+		static_cast<size_t>(bufferSize));
 	vkUnmapMemory(device, m_SphereBufferMemory);
+}
+
+const ComputeRenderer::Sphere& ComputeRenderer::GetSphere(uint32_t index) const
+{
+	return m_Spheres.at(index);
+}
+
+void ComputeRenderer::SetSphere(uint32_t index, const Sphere& sphere)
+{
+	Sphere sanitizedSphere = sphere;
+	sanitizedSphere.Radius = std::clamp(sanitizedSphere.Radius, 0.05f, 200.0f);
+	sanitizedSphere.Albedo = glm::clamp(
+		sanitizedSphere.Albedo,
+		glm::vec3(0.0f),
+		glm::vec3(1.0f));
+	sanitizedSphere.Reflectivity =
+		std::clamp(sanitizedSphere.Reflectivity, 0.0f, 1.0f);
+	sanitizedSphere.Roughness =
+		std::clamp(sanitizedSphere.Roughness, 0.0f, 1.0f);
+
+	m_Spheres.at(index) = sanitizedSphere;
+	UploadSceneBuffer();
+	ResetAccumulation();
 }
 
 uint32_t ComputeRenderer::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const
@@ -399,7 +452,7 @@ void ComputeRenderer::Render()
 	pushConstants.FrameIndex = m_FrameIndex;
 	pushConstants.VerticalFov = m_VerticalFov;
 	pushConstants.Exposure = m_Exposure;
-	pushConstants.SphereCount = m_SphereCount;
+	pushConstants.SphereCount = SphereCount;
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 

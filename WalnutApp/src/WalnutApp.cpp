@@ -61,6 +61,49 @@ public:
 
 		ImGui::End();
 
+		ImGui::Begin("Scene Controls");
+		ImGui::SliderInt(
+			"Sphere Index",
+			&m_SelectedSphereIndex,
+			0,
+			static_cast<int>(ComputeRenderer::SphereCount) - 1);
+
+		ComputeRenderer::Sphere sphere = m_Renderer.GetSphere(
+			static_cast<uint32_t>(m_SelectedSphereIndex));
+		bool sphereChanged = false;
+		sphereChanged |= ImGui::DragFloat3(
+			"Center",
+			&sphere.Center.x,
+			0.05f);
+		sphereChanged |= ImGui::DragFloat(
+			"Radius",
+			&sphere.Radius,
+			0.05f,
+			0.05f,
+			200.0f);
+		sphereChanged |= ImGui::ColorEdit3(
+			"Albedo",
+			&sphere.Albedo.x);
+		sphereChanged |= ImGui::SliderFloat(
+			"Reflectivity",
+			&sphere.Reflectivity,
+			0.0f,
+			1.0f);
+		sphereChanged |= ImGui::SliderFloat(
+			"Roughness",
+			&sphere.Roughness,
+			0.0f,
+			1.0f);
+
+		if (sphereChanged)
+		{
+			m_Renderer.SetSphere(
+				static_cast<uint32_t>(m_SelectedSphereIndex),
+				sphere);
+		}
+
+		ImGui::End();
+
 		m_Renderer.Render();
 
 		ImGui::Begin("Compute Shader Output");
@@ -99,6 +142,7 @@ private:
 	float m_CameraPitch = 0.0f;
 	float m_VerticalFov = 45.0f;
 	float m_Exposure = 1.0f;
+	int m_SelectedSphereIndex = 0;
 };
 
 Walnut::Application* Walnut::CreateApplication(int argc, char** argv)
