@@ -1,5 +1,6 @@
 #include "Walnut/Application.h"
 #include "Walnut/EntryPoint.h"
+#include "Walnut/Input/Input.h"
 
 #include "ComputeRenderer.h"
 
@@ -20,6 +21,71 @@ public:
 	{
 		m_Renderer.Init("assets/shaders/RayTracing.comp.spv", 1600, 900);
 		UpdateCamera();
+	}
+
+	virtual void OnDetach() override
+	{
+		SetMouseLookEnabled(false);
+	}
+
+	virtual void OnUpdate(float timeStep) override
+	{
+		if (!m_MouseLookEnabled)
+			return;
+
+		if (Walnut::Input::IsKeyDown(Walnut::KeyCode::Escape))
+		{
+			SetMouseLookEnabled(false);
+			return;
+		}
+
+		bool cameraChanged = false;
+		const glm::vec3 forward = CalculateCameraForward();
+		const glm::vec3 right = glm::normalize(glm::cross(
+			forward,
+			glm::vec3(0.0f, 1.0f, 0.0f)));
+
+		glm::vec3 movement(0.0f);
+		if (Walnut::Input::IsKeyDown(Walnut::KeyCode::W))
+			movement += forward;
+		if (Walnut::Input::IsKeyDown(Walnut::KeyCode::S))
+			movement -= forward;
+		if (Walnut::Input::IsKeyDown(Walnut::KeyCode::D))
+			movement += right;
+		if (Walnut::Input::IsKeyDown(Walnut::KeyCode::A))
+			movement -= right;
+
+		if (glm::dot(movement, movement) > 0.0f)
+		{
+			m_CameraPosition +=
+				glm::normalize(movement) *
+				m_CameraMoveSpeed *
+				timeStep;
+			cameraChanged = true;
+		}
+
+		const glm::vec2 mousePosition = Walnut::Input::GetMousePosition();
+		if (!m_HasMousePosition)
+		{
+			m_LastMousePosition = mousePosition;
+			m_HasMousePosition = true;
+		}
+		else
+		{
+			const glm::vec2 mouseDelta = mousePosition - m_LastMousePosition;
+			m_LastMousePosition = mousePosition;
+
+			if (glm::dot(mouseDelta, mouseDelta) > 0.0f)
+			{
+				m_CameraYaw += mouseDelta.x * m_MouseSensitivity;
+				m_CameraPitch -= mouseDelta.y * m_MouseSensitivity;
+				m_CameraPitch = glm::clamp(m_CameraPitch, -89.0f, 89.0f);
+				cameraChanged = true;
+			}
+		}
+
+		if (cameraChanged)
+			UpdateCamera();
 	}
 
 	virtual void OnUIRender() override
@@ -63,6 +129,20 @@ public:
 			m_VerticalFov = 45.0f;
 			cameraChanged = true;
 		}
+
+		ImGui::SliderFloat(
+			"Move Speed",
+			&m_CameraMoveSpeed,
+			0.5f,
+			15.0f);
+		if (ImGui::Button(
+			m_MouseLookEnabled
+				? "Disable Mouse Look"
+				: "Enable Mouse Look"))
+		{
+			SetMouseLookEnabled(!m_MouseLookEnabled);
+		}
+		ImGui::TextWrapped("WASD: Move | Mouse: Look | Esc: Release");
 
 		if (cameraChanged)
 			UpdateCamera();
@@ -226,7 +306,7 @@ public:
 	}
 
 private:
-	void UpdateCamera()
+	glm::vec3 CalculateCameraForward() const
 	{
 		const float yaw = glm::radians(m_CameraYaw);
 		const float pitch = glm::radians(m_CameraPitch);
@@ -235,11 +315,28 @@ private:
 		forward.x = glm::cos(pitch) * glm::sin(yaw);
 		forward.y = glm::sin(pitch);
 		forward.z = -glm::cos(pitch) * glm::cos(yaw);
+		return glm::normalize(forward);
+	}
 
+	void UpdateCamera()
+	{
 		m_Renderer.SetCamera(
 			m_CameraPosition,
-			glm::normalize(forward),
+			CalculateCameraForward(),
 			m_VerticalFov);
+	}
+
+	void SetMouseLookEnabled(bool enabled)
+	{
+		if (m_MouseLookEnabled == enabled)
+			return;
+
+		m_MouseLookEnabled = enabled;
+		m_HasMousePosition = false;
+		Walnut::Input::SetCursorMode(
+			enabled
+				? Walnut::CursorMode::Locked
+				: Walnut::CursorMode::Normal);
 	}
 
 private:
@@ -249,6 +346,11 @@ private:
 	float m_CameraPitch = 0.0f;
 	float m_VerticalFov = 45.0f;
 	float m_Exposure = 1.0f;
+	float m_CameraMoveSpeed = 3.0f;
+	float m_MouseSensitivity = 0.1f;
+	glm::vec2 m_LastMousePosition = { 0.0f, 0.0f };
+	bool m_HasMousePosition = false;
+	bool m_MouseLookEnabled = false;
 	int m_SelectedSphereIndex = 0;
 	std::string m_SceneStatus;
 };
