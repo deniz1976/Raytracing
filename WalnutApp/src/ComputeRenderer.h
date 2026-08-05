@@ -33,6 +33,7 @@ public:
 
 	void Init(const std::string& shaderPath, uint32_t width, uint32_t height);
 	void Render();
+	void Resize(uint32_t width, uint32_t height);
 	void SetCamera(
 		const glm::vec3& position,
 		const glm::vec3& forward,
@@ -63,6 +64,8 @@ private:
 		VkDeviceMemory& memory,
 		VkImageView& imageView);
 	void CreateOutputImages();
+	void UpdateComputeImageDescriptors();
+	void UpdateImGuiImageDescriptor();
 	void CreateSceneBuffer();
 	void UploadSceneBuffer();
 	void CreateComputeDescriptors();

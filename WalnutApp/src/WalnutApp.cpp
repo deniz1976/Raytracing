@@ -291,17 +291,37 @@ public:
 
 		ImGui::End();
 
-		m_Renderer.Render();
-
 		ImGui::Begin("Compute Shader Output");
+		ImGui::Text(
+			"Resolution: %u x %u",
+			m_Renderer.GetWidth(),
+			m_Renderer.GetHeight());
 		ImGui::Text(
 			"Soft shadows: %u samples per pixel",
 			m_Renderer.GetFrameIndex());
-		ImGui::Image(
-			(ImTextureID)m_Renderer.GetImageDescriptorSet(),
-			ImVec2((float)m_Renderer.GetWidth(), (float)m_Renderer.GetHeight()),
-			ImVec2(0.0f, 1.0f),
-			ImVec2(1.0f, 0.0f));
+
+		const ImVec2 viewportSize = ImGui::GetContentRegionAvail();
+		if (viewportSize.x >= 16.0f && viewportSize.y >= 16.0f)
+		{
+			const uint32_t viewportWidth =
+				static_cast<uint32_t>(viewportSize.x);
+			const uint32_t viewportHeight =
+				static_cast<uint32_t>(viewportSize.y);
+			m_Renderer.Resize(viewportWidth, viewportHeight);
+			m_Renderer.Render();
+
+			ImGui::Image(
+				(ImTextureID)m_Renderer.GetImageDescriptorSet(),
+				ImVec2(
+					static_cast<float>(m_Renderer.GetWidth()),
+					static_cast<float>(m_Renderer.GetHeight())),
+				ImVec2(0.0f, 1.0f),
+				ImVec2(1.0f, 0.0f));
+		}
+		else
+		{
+			ImGui::Text("Viewport is too small to render.");
+		}
 		ImGui::End();
 	}
 

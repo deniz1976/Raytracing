@@ -467,6 +467,46 @@ void ComputeRenderer::ResetAccumulation()
 	m_FrameIndex = 0;
 }
 
+void ComputeRenderer::Resize(uint32_t width, uint32_t height)
+{
+	if (width == 0 || height == 0 ||
+		(width == m_Width && height == m_Height))
+	{
+		return;
+	}
+
+	VkDevice device = Walnut::Application::GetDevice();
+	check_vk_result(vkDeviceWaitIdle(device));
+
+	VkImage oldOutputImage = m_OutputImage;
+	VkDeviceMemory oldOutputImageMemory = m_OutputImageMemory;
+	VkImageView oldOutputImageView = m_OutputImageView;
+	VkImage oldAccumulationImage = m_AccumulationImage;
+	VkDeviceMemory oldAccumulationImageMemory = m_AccumulationImageMemory;
+	VkImageView oldAccumulationImageView = m_AccumulationImageView;
+
+	m_Width = width;
+	m_Height = height;
+	m_OutputImage = VK_NULL_HANDLE;
+	m_OutputImageMemory = VK_NULL_HANDLE;
+	m_OutputImageView = VK_NULL_HANDLE;
+	m_AccumulationImage = VK_NULL_HANDLE;
+	m_AccumulationImageMemory = VK_NULL_HANDLE;
+	m_AccumulationImageView = VK_NULL_HANDLE;
+
+	CreateOutputImages();
+	UpdateComputeImageDescriptors();
+
+	vkDestroyImageView(device, oldOutputImageView, nullptr);
+	vkDestroyImage(device, oldOutputImage, nullptr);
+	vkFreeMemory(device, oldOutputImageMemory, nullptr);
+	vkDestroyImageView(device, oldAccumulationImageView, nullptr);
+	vkDestroyImage(device, oldAccumulationImage, nullptr);
+	vkFreeMemory(device, oldAccumulationImageMemory, nullptr);
+
+	ResetAccumulation();
+}
+
 void ComputeRenderer::CreateImage(
 	VkFormat format,
 	VkImageUsageFlags usage,
@@ -531,16 +571,20 @@ void ComputeRenderer::CreateOutputImages()
 		m_AccumulationImageMemory,
 		m_AccumulationImageView);
 
-	VkSamplerCreateInfo samplerInfo{};
-	samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-	samplerInfo.magFilter = VK_FILTER_LINEAR;
-	samplerInfo.minFilter = VK_FILTER_LINEAR;
-	samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-	samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-	samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-	samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-	samplerInfo.maxLod = 1.0f;
-	check_vk_result(vkCreateSampler(device, &samplerInfo, nullptr, &m_OutputSampler));
+	if (m_OutputSampler == VK_NULL_HANDLE)
+	{
+		VkSamplerCreateInfo samplerInfo{};
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		samplerInfo.magFilter = VK_FILTER_LINEAR;
+		samplerInfo.minFilter = VK_FILTER_LINEAR;
+		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.maxLod = 1.0f;
+		check_vk_result(vkCreateSampler(
+			device, &samplerInfo, nullptr, &m_OutputSampler));
+	}
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
@@ -571,10 +615,71 @@ void ComputeRenderer::CreateOutputImages()
 
 	Walnut::Application::FlushCommandBuffer(commandBuffer);
 
-	m_ImGuiDescriptorSet = ImGui_ImplVulkan_AddTexture(
-		m_OutputSampler,
-		m_OutputImageView,
-		VK_IMAGE_LAYOUT_GENERAL);
+	if (m_ImGuiDescriptorSet == VK_NULL_HANDLE)
+	{
+		m_ImGuiDescriptorSet = ImGui_ImplVulkan_AddTexture(
+			m_OutputSampler,
+			m_OutputImageView,
+			VK_IMAGE_LAYOUT_GENERAL);
+	}
+	else
+	{
+		UpdateImGuiImageDescriptor();
+	}
+}
+
+void ComputeRenderer::UpdateComputeImageDescriptors()
+{
+	VkDescriptorImageInfo descriptorImages[2]{};
+	descriptorImages[0].imageView = m_OutputImageView;
+	descriptorImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+	descriptorImages[1].imageView = m_AccumulationImageView;
+	descriptorImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+	VkWriteDescriptorSet descriptorWrites[2]{};
+	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
+	{
+		descriptorWrites[bindingIndex].sType =
+			VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[bindingIndex].dstSet = m_ComputeDescriptorSet;
+		descriptorWrites[bindingIndex].dstBinding = bindingIndex;
+		descriptorWrites[bindingIndex].descriptorCount = 1;
+		descriptorWrites[bindingIndex].descriptorType =
+			VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		descriptorWrites[bindingIndex].pImageInfo =
+			&descriptorImages[bindingIndex];
+	}
+
+	vkUpdateDescriptorSets(
+		Walnut::Application::GetDevice(),
+		2,
+		descriptorWrites,
+		0,
+		nullptr);
+}
+
+void ComputeRenderer::UpdateImGuiImageDescriptor()
+{
+	VkDescriptorImageInfo descriptorImage{};
+	descriptorImage.sampler = m_OutputSampler;
+	descriptorImage.imageView = m_OutputImageView;
+	descriptorImage.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+	VkWriteDescriptorSet descriptorWrite{};
+	descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	descriptorWrite.dstSet = m_ImGuiDescriptorSet;
+	descriptorWrite.dstBinding = 0;
+	descriptorWrite.descriptorCount = 1;
+	descriptorWrite.descriptorType =
+		VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	descriptorWrite.pImageInfo = &descriptorImage;
+
+	vkUpdateDescriptorSets(
+		Walnut::Application::GetDevice(),
+		1,
+		&descriptorWrite,
+		0,
+		nullptr);
 }
 
 void ComputeRenderer::CreateComputeDescriptors()
