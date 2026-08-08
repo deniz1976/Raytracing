@@ -54,6 +54,9 @@ public:
 	uint32_t GetHeight() const { return m_Height; }
 	uint32_t GetFrameIndex() const { return m_FrameIndex; }
 	uint32_t GetSphereCount() const { return static_cast<uint32_t>(m_Spheres.size()); }
+	float GetCpuRenderTimeMs() const { return m_CpuRenderTimeMs; }
+	float GetGpuComputeTimeMs() const { return m_GpuComputeTimeMs; }
+	bool AreGpuTimestampsSupported() const { return m_TimestampQueryPool != VK_NULL_HANDLE; }
 
 private:
 	uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
@@ -70,9 +73,13 @@ private:
 	void UploadSceneBuffer();
 	void CreateComputeDescriptors();
 	void CreateComputePipeline(const std::string& shaderPath);
+	void CreateTimestampQueryPool();
+	void ReadGpuComputeTime();
 	void Release();
 
 private:
+	static constexpr uint32_t TimestampQueryCount = 2;
+
 	uint32_t m_Width = 0;
 	uint32_t m_Height = 0;
 	uint32_t m_FrameIndex = 0;
@@ -108,4 +115,10 @@ private:
 
 	VkPipelineLayout m_ComputePipelineLayout = VK_NULL_HANDLE;
 	VkPipeline m_ComputePipeline = VK_NULL_HANDLE;
+
+	VkQueryPool m_TimestampQueryPool = VK_NULL_HANDLE;
+	uint64_t m_TimestampValidMask = 0;
+	float m_TimestampPeriodNs = 0.0f;
+	float m_CpuRenderTimeMs = 0.0f;
+	float m_GpuComputeTimeMs = 0.0f;
 };

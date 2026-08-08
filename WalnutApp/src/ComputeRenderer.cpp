@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -101,6 +102,18 @@ namespace
 			std::isfinite(light.Intensity);
 	}
 
+	constexpr float TimingSmoothingFactor = 0.05f;
+
+	// Raw per-frame timings jitter far too much to read in the UI, so every
+	// sample is folded into an exponential moving average instead.
+	float SmoothTiming(float averageMs, float sampleMs)
+	{
+		if (averageMs <= 0.0f)
+			return sampleMs;
+
+		return averageMs + (sampleMs - averageMs) * TimingSmoothingFactor;
+	}
+
 	std::vector<uint32_t> ReadShaderFile(const std::string& path)
 	{
 		std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -133,6 +146,86 @@ void ComputeRenderer::Init(const std::string& shaderPath, uint32_t width, uint32
 	CreateSceneBuffer();
 	CreateComputeDescriptors();
 	CreateComputePipeline(shaderPath);
+	CreateTimestampQueryPool();
+}
+
+void ComputeRenderer::CreateTimestampQueryPool()
+{
+	VkPhysicalDevice physicalDevice = Walnut::Application::GetPhysicalDevice();
+
+	VkPhysicalDeviceProperties deviceProperties{};
+	vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
+
+	// A timestampPeriod of zero would make the tick to millisecond conversion
+	// meaningless, so treat it the same way as missing hardware support.
+	if (deviceProperties.limits.timestampComputeAndGraphics != VK_TRUE ||
+		deviceProperties.limits.timestampPeriod <= 0.0f)
+	{
+		return;
+	}
+
+	uint32_t queueFamilyCount = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties(
+		physicalDevice, &queueFamilyCount, nullptr);
+	std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+	vkGetPhysicalDeviceQueueFamilyProperties(
+		physicalDevice, &queueFamilyCount, queueFamilies.data());
+
+	const uint32_t queueFamilyIndex = Walnut::Application::GetQueueFamily();
+	if (queueFamilyIndex >= queueFamilyCount)
+		return;
+
+	const uint32_t validBits =
+		queueFamilies[queueFamilyIndex].timestampValidBits;
+	if (validBits == 0)
+		return;
+
+	// Only the low validBits of every timestamp carry data; the rest must be
+	// masked off before two timestamps can be subtracted.
+	m_TimestampValidMask = validBits >= 64
+		? ~static_cast<uint64_t>(0)
+		: (static_cast<uint64_t>(1) << validBits) - 1;
+	m_TimestampPeriodNs = deviceProperties.limits.timestampPeriod;
+
+	VkQueryPoolCreateInfo queryPoolInfo{};
+	queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+	queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+	queryPoolInfo.queryCount = TimestampQueryCount;
+	check_vk_result(vkCreateQueryPool(
+		Walnut::Application::GetDevice(),
+		&queryPoolInfo,
+		nullptr,
+		&m_TimestampQueryPool));
+}
+
+void ComputeRenderer::ReadGpuComputeTime()
+{
+	if (m_TimestampQueryPool == VK_NULL_HANDLE)
+		return;
+
+	// FlushCommandBuffer already waited on a fence, so both queries have
+	// finished and this read never blocks.
+	std::array<uint64_t, TimestampQueryCount> timestamps{};
+	const VkResult result = vkGetQueryPoolResults(
+		Walnut::Application::GetDevice(),
+		m_TimestampQueryPool,
+		0,
+		TimestampQueryCount,
+		sizeof(timestamps),
+		timestamps.data(),
+		sizeof(uint64_t),
+		VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+	if (result != VK_SUCCESS)
+		return;
+
+	const uint64_t begin = timestamps[0] & m_TimestampValidMask;
+	const uint64_t end = timestamps[1] & m_TimestampValidMask;
+	if (end < begin)
+		return;
+
+	const float elapsedMs =
+		static_cast<float>(end - begin) * m_TimestampPeriodNs / 1000000.0f;
+	m_GpuComputeTimeMs = SmoothTiming(m_GpuComputeTimeMs, elapsedMs);
 }
 
 void ComputeRenderer::CreateSceneBuffer()
@@ -802,6 +895,9 @@ void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)
 
 void ComputeRenderer::Render()
 {
+	const std::chrono::steady_clock::time_point cpuRenderBegin =
+		std::chrono::steady_clock::now();
+
 	m_FrameIndex++;
 	PushConstants pushConstants{};
 	pushConstants.CameraPosition = glm::vec4(m_CameraPosition, 1.0f);
@@ -817,6 +913,17 @@ void ComputeRenderer::Render()
 	pushConstants.LightSizePadding = glm::vec4(m_AreaLight.Size, 0.0f, 0.0f);
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
+
+	// Queries hold results from the previous frame and must be reset before
+	// they can be written again.
+	if (m_TimestampQueryPool != VK_NULL_HANDLE)
+	{
+		vkCmdResetQueryPool(
+			commandBuffer,
+			m_TimestampQueryPool,
+			0,
+			TimestampQueryCount);
+	}
 
 	vkCmdBindPipeline(
 		commandBuffer,
@@ -843,7 +950,28 @@ void ComputeRenderer::Render()
 
 	const uint32_t groupCountX = (m_Width + 7) / 8;
 	const uint32_t groupCountY = (m_Height + 7) / 8;
+
+	// The two timestamps bracket only the dispatch, so their difference is the
+	// time the GPU itself spent tracing rays.
+	if (m_TimestampQueryPool != VK_NULL_HANDLE)
+	{
+		vkCmdWriteTimestamp(
+			commandBuffer,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			m_TimestampQueryPool,
+			0);
+	}
+
 	vkCmdDispatch(commandBuffer, groupCountX, groupCountY, 1);
+
+	if (m_TimestampQueryPool != VK_NULL_HANDLE)
+	{
+		vkCmdWriteTimestamp(
+			commandBuffer,
+			VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+			m_TimestampQueryPool,
+			1);
+	}
 
 	VkImageMemoryBarrier computeBarriers[2]{};
 	for (VkImageMemoryBarrier& barrier : computeBarriers)
@@ -874,6 +1002,18 @@ void ComputeRenderer::Render()
 		2, computeBarriers);
 
 	Walnut::Application::FlushCommandBuffer(commandBuffer);
+
+	ReadGpuComputeTime();
+
+	// This includes the fence wait inside FlushCommandBuffer, so it measures
+	// how long the whole render call blocks the CPU rather than CPU-only work.
+	// Compute and present share one queue, so on a vsync limited swapchain this
+	// wait also absorbs the wait for the display and tracks the frame time
+	// instead of the dispatch cost. Use m_GpuComputeTimeMs to judge the shader.
+	const std::chrono::duration<float, std::milli> cpuRenderDuration =
+		std::chrono::steady_clock::now() - cpuRenderBegin;
+	m_CpuRenderTimeMs =
+		SmoothTiming(m_CpuRenderTimeMs, cpuRenderDuration.count());
 }
 
 void ComputeRenderer::Release()
@@ -894,14 +1034,17 @@ void ComputeRenderer::Release()
 	VkDeviceMemory accumulationImageMemory = m_AccumulationImageMemory;
 	VkBuffer sphereBuffer = m_SphereBuffer;
 	VkDeviceMemory sphereBufferMemory = m_SphereBufferMemory;
+	VkQueryPool timestampQueryPool = m_TimestampQueryPool;
 
 	Walnut::Application::SubmitResourceFree(
 		[pipeline, pipelineLayout, descriptorPool, descriptorSetLayout,
 		 sampler, outputImageView, outputImage, outputImageMemory,
 		 accumulationImageView, accumulationImage, accumulationImageMemory,
-		 sphereBuffer, sphereBufferMemory]()
+		 sphereBuffer, sphereBufferMemory, timestampQueryPool]()
 		{
 			VkDevice device = Walnut::Application::GetDevice();
+			if (timestampQueryPool != VK_NULL_HANDLE)
+				vkDestroyQueryPool(device, timestampQueryPool, nullptr);
 			vkDestroyPipeline(device, pipeline, nullptr);
 			vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
 			vkDestroyDescriptorPool(device, descriptorPool, nullptr);
@@ -918,4 +1061,5 @@ void ComputeRenderer::Release()
 		});
 
 	m_OutputImage = VK_NULL_HANDLE;
+	m_TimestampQueryPool = VK_NULL_HANDLE;
 }

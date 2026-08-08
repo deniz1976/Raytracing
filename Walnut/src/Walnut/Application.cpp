@@ -709,6 +709,11 @@ namespace Walnut {
 		return g_Device;
 	}
 
+	uint32_t Application::GetQueueFamily()
+	{
+		return g_QueueFamily;
+	}
+
 	VkCommandBuffer Application::GetCommandBuffer(bool begin)
 	{
 		ImGui_ImplVulkanH_Window* wd = &g_MainWindowData;

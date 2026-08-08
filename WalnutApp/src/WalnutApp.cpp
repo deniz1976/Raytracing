@@ -292,13 +292,6 @@ public:
 		ImGui::End();
 
 		ImGui::Begin("Compute Shader Output");
-		ImGui::Text(
-			"Resolution: %u x %u",
-			m_Renderer.GetWidth(),
-			m_Renderer.GetHeight());
-		ImGui::Text(
-			"Soft shadows: %u samples per pixel",
-			m_Renderer.GetFrameIndex());
 
 		const ImVec2 viewportSize = ImGui::GetContentRegionAvail();
 		if (viewportSize.x >= 16.0f && viewportSize.y >= 16.0f)
@@ -322,6 +315,46 @@ public:
 		{
 			ImGui::Text("Viewport is too small to render.");
 		}
+		ImGui::End();
+
+		// Drawn after the render call so the numbers describe the frame that
+		// was just traced instead of the previous one.
+		ImGui::Begin("Performance");
+		const float framesPerSecond = ImGui::GetIO().Framerate;
+		ImGui::Text("FPS: %.1f", framesPerSecond);
+		ImGui::Text(
+			"Frame time: %.3f ms",
+			framesPerSecond > 0.0f ? 1000.0f / framesPerSecond : 0.0f);
+		ImGui::Text(
+			"CPU render time: %.3f ms",
+			m_Renderer.GetCpuRenderTimeMs());
+
+		if (m_Renderer.AreGpuTimestampsSupported())
+		{
+			ImGui::Text(
+				"GPU compute time: %.3f ms",
+				m_Renderer.GetGpuComputeTimeMs());
+		}
+		else
+		{
+			ImGui::Text("GPU compute time: timestamps not supported");
+		}
+
+		ImGui::Separator();
+		ImGui::Text(
+			"Resolution: %u x %u",
+			m_Renderer.GetWidth(),
+			m_Renderer.GetHeight());
+		ImGui::Text(
+			"Soft shadows: %u samples per pixel",
+			m_Renderer.GetFrameIndex());
+		ImGui::TextWrapped(
+			"GPU compute time is the dispatch alone, measured with timestamp "
+			"queries. CPU render time also covers command buffer setup, "
+			"submission and the fence wait. Because compute and present share "
+			"one queue and the swapchain is vsync limited, that wait absorbs "
+			"the wait for the display, so CPU render time stays near the frame "
+			"time even when the dispatch is much shorter.");
 		ImGui::End();
 	}
 
