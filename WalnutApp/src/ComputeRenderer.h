@@ -33,6 +33,10 @@ public:
 	// can always hold a tree built over MaxSphereCount spheres.
 	static constexpr uint32_t MaxBvhNodeCount = 2 * MaxSphereCount;
 
+	// Every light costs one shadow ray per bounce, so this capacity is kept far
+	// smaller than the sphere capacity.
+	static constexpr uint32_t MaxLightCount = 8;
+
 	~ComputeRenderer();
 
 	void Init(const std::string& shaderPath, uint32_t width, uint32_t height);
@@ -49,8 +53,10 @@ public:
 	bool RemoveSphere(uint32_t index);
 	bool SaveScene(const std::string& path, std::string& errorMessage) const;
 	bool LoadScene(const std::string& path, std::string& errorMessage);
-	const AreaLight& GetAreaLight() const { return m_AreaLight; }
-	void SetAreaLight(const AreaLight& light);
+	const AreaLight& GetLight(uint32_t index) const;
+	void SetLight(uint32_t index, const AreaLight& light);
+	bool AddLight();
+	bool RemoveLight(uint32_t index);
 	void SetBvhEnabled(bool enabled) { m_UseBvh = enabled; }
 	bool IsBvhEnabled() const { return m_UseBvh; }
 	void ResetAccumulation();
@@ -60,6 +66,7 @@ public:
 	uint32_t GetHeight() const { return m_Height; }
 	uint32_t GetFrameIndex() const { return m_FrameIndex; }
 	uint32_t GetSphereCount() const { return static_cast<uint32_t>(m_Spheres.size()); }
+	uint32_t GetLightCount() const { return static_cast<uint32_t>(m_Lights.size()); }
 	uint32_t GetBvhNodeCount() const { return m_BvhNodeCount; }
 	uint32_t GetBvhDepth() const { return m_BvhDepth; }
 	float GetCpuRenderTimeMs() const { return m_CpuRenderTimeMs; }
@@ -79,6 +86,7 @@ private:
 	void UpdateImGuiImageDescriptor();
 	void CreateSceneBuffer();
 	void CreateBvhBuffer();
+	void CreateLightBuffer();
 	void CreateHostBuffer(
 		VkDeviceSize size,
 		VkBuffer& buffer,
@@ -88,6 +96,7 @@ private:
 		const void* data,
 		VkDeviceSize size) const;
 	void UploadSceneBuffer();
+	void UploadLightBuffer();
 	void BuildBvh();
 	void CreateComputeDescriptors();
 	void CreateComputePipeline(const std::string& shaderPath);
@@ -106,12 +115,7 @@ private:
 	float m_VerticalFov = 45.0f;
 	float m_Exposure = 1.0f;
 	std::vector<Sphere> m_Spheres;
-	AreaLight m_AreaLight = {
-		{ -2.5f, 5.0f, 2.0f },
-		{ 1.0f, 0.95f, 0.85f },
-		{ 3.0f, 3.0f },
-		24.0f
-	};
+	std::vector<AreaLight> m_Lights;
 
 	bool m_UseBvh = true;
 	// Spheres are uploaded in BVH leaf order, so a leaf can point at a
@@ -125,6 +129,9 @@ private:
 
 	VkBuffer m_BvhBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_BvhBufferMemory = VK_NULL_HANDLE;
+
+	VkBuffer m_LightBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_LightBufferMemory = VK_NULL_HANDLE;
 
 	VkImage m_OutputImage = VK_NULL_HANDLE;
 	VkDeviceMemory m_OutputImageMemory = VK_NULL_HANDLE;

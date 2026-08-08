@@ -32,6 +32,20 @@ layout(std430, set = 0, binding = 3) readonly buffer BvhBuffer
 	BvhNodeData Nodes[];
 } u_BvhBuffer;
 
+// Position and intensity share a vec4 because std430 pads a lone vec3 out to 16
+// bytes anyway, so the packing costs nothing and keeps the stride at 48 bytes.
+struct AreaLightData
+{
+	vec4 PositionIntensity;
+	vec4 Color;
+	vec4 SizePadding;
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer LightBuffer
+{
+	AreaLightData Lights[];
+} u_LightBuffer;
+
 layout(push_constant) uniform PushConstants
 {
 	vec4 CameraPosition;
@@ -40,10 +54,7 @@ layout(push_constant) uniform PushConstants
 	float VerticalFov;
 	float Exposure;
 	uint SphereCount;
-	vec4 LightPositionIntensity;
-	vec4 LightColor;
-	vec4 LightSizePadding;
-	uvec4 TraversalSettings;
+	uvec4 SceneSettings;
 } u_PushConstants;
 
 const int MAX_BOUNCES = 3;
@@ -233,7 +244,7 @@ bool TraceScene(
 {
 	closestHit.Distance = 1e30;
 
-	if (u_PushConstants.TraversalSettings.x == 0u)
+	if (u_PushConstants.SceneSettings.x == 0u)
 	{
 		return IntersectSphereRange(
 			ray,
@@ -296,7 +307,7 @@ bool IsOccluded(
 	shadowRay.Origin = surfacePosition + surfaceNormal * RAY_EPSILON;
 	shadowRay.Direction = directionToLight;
 
-	if (u_PushConstants.TraversalSettings.x == 0u)
+	if (u_PushConstants.SceneSettings.x == 0u)
 	{
 		for (uint sphereIndex = 0; sphereIndex < u_PushConstants.SphereCount; sphereIndex++)
 		{
@@ -357,6 +368,26 @@ bool IsOccluded(
 	return false;
 }
 
+AreaLight GetAreaLight(uint lightIndex)
+{
+	AreaLightData data = u_LightBuffer.Lights[lightIndex];
+
+	AreaLight light;
+	light.Position = data.PositionIntensity.xyz;
+	light.Intensity = data.PositionIntensity.w;
+	light.Color = data.Color.xyz;
+	light.Size = data.SizePadding.xy;
+	return light;
+}
+
+// The ambient term stands in for light that never arrives directly, so it is a
+// property of the surface and is added exactly once. Adding it inside the light
+// loop would make the scene brighter with every light that is created.
+vec3 CalculateAmbientLight(Material material)
+{
+	return material.Albedo * 0.08;
+}
+
 vec3 CalculateAreaLight(
 	AreaLight light,
 	Material material,
@@ -372,14 +403,11 @@ vec3 CalculateAreaLight(
 		light.Intensity /
 		max(lightDistance * lightDistance, 0.01);
 
-	vec3 ambientColor = material.Albedo * 0.08;
-	vec3 diffuseColor =
+	return
 		material.Albedo *
 		light.Color *
 		diffuseStrength *
 		attenuation;
-
-	return ambientColor + diffuseColor;
 }
 
 vec3 GetSkyColor(vec3 rayDirection)
@@ -402,13 +430,13 @@ vec3 ApplyGammaCorrection(vec3 linearColor)
 
 vec3 TraceRay(
 	Ray initialRay,
-	AreaLight light,
 	uint randomSeed)
 {
 	Ray ray = initialRay;
 	vec3 accumulatedColor = vec3(0.0);
 	vec3 throughput = vec3(1.0);
 	uint randomState = randomSeed;
+	uint lightCount = u_PushConstants.SceneSettings.y;
 
 	for (int bounceIndex = 0; bounceIndex < MAX_BOUNCES; bounceIndex++)
 	{
@@ -420,36 +448,51 @@ vec3 TraceRay(
 			break;
 		}
 
-		vec2 lightOffset =
-			(vec2(
-				NextRandom(randomState),
-				NextRandom(randomState)) - 0.5) *
-			light.Size;
-		vec3 sampledLightPosition =
-			light.Position +
-			vec3(lightOffset.x, 0.0, lightOffset.y);
+		vec3 surfaceColor = CalculateAmbientLight(closestHit.SurfaceMaterial);
 
-		vec3 surfaceToLight =
-			sampledLightPosition -
-			closestHit.Position;
-		float lightDistance = length(surfaceToLight);
-		vec3 directionToLight =
-			surfaceToLight / lightDistance;
+		// Every light is sampled independently and its contribution is summed,
+		// which is why light count multiplies the shadow ray cost per bounce.
+		for (uint lightIndex = 0; lightIndex < lightCount; lightIndex++)
+		{
+			AreaLight light = GetAreaLight(lightIndex);
 
-		bool isInShadow = IsOccluded(
-			closestHit.Position,
-			closestHit.Normal,
-			directionToLight,
-			lightDistance);
+			vec2 lightOffset =
+				(vec2(
+					NextRandom(randomState),
+					NextRandom(randomState)) - 0.5) *
+				light.Size;
+			vec3 sampledLightPosition =
+				light.Position +
+				vec3(lightOffset.x, 0.0, lightOffset.y);
 
-		float lightVisibility = isInShadow ? 0.0 : 1.0;
-		vec3 surfaceColor = CalculateAreaLight(
-			light,
-			closestHit.SurfaceMaterial,
-			closestHit.Normal,
-			directionToLight,
-			lightDistance,
-			lightVisibility);
+			vec3 surfaceToLight =
+				sampledLightPosition -
+				closestHit.Position;
+			float lightDistance = length(surfaceToLight);
+
+			// A light sampled exactly on the surface would divide by zero and
+			// poison the running sum with a NaN.
+			if (lightDistance < RAY_EPSILON)
+				continue;
+
+			vec3 directionToLight =
+				surfaceToLight / lightDistance;
+
+			bool isInShadow = IsOccluded(
+				closestHit.Position,
+				closestHit.Normal,
+				directionToLight,
+				lightDistance);
+
+			float lightVisibility = isInShadow ? 0.0 : 1.0;
+			surfaceColor += CalculateAreaLight(
+				light,
+				closestHit.SurfaceMaterial,
+				closestHit.Normal,
+				directionToLight,
+				lightDistance,
+				lightVisibility);
+		}
 
 		float reflectivity = closestHit.SurfaceMaterial.Reflectivity;
 		accumulatedColor +=
@@ -529,14 +572,8 @@ void main()
 			screenPosition.y *
 			fieldOfViewScale);
 
-	AreaLight light;
-	light.Position = u_PushConstants.LightPositionIntensity.xyz;
-	light.Intensity = u_PushConstants.LightPositionIntensity.w;
-	light.Color = u_PushConstants.LightColor.xyz;
-	light.Size = u_PushConstants.LightSizePadding.xy;
-
 	uint pathSeed = frameSeed ^ 0xa511e9b3u;
-	vec3 sampleColor = TraceRay(ray, light, pathSeed);
+	vec3 sampleColor = TraceRay(ray, pathSeed);
 	vec3 previousAccumulation =
 		u_PushConstants.FrameIndex > 1
 			? imageLoad(u_AccumulationImage, pixel).rgb

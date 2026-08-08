@@ -18,6 +18,8 @@
 
 namespace
 {
+	// SceneSettings.x is 1 when the BVH should be traversed, .y is the number of
+	// lights in the light buffer. The remaining two slots are reserved padding.
 	struct alignas(16) PushConstants
 	{
 		glm::vec4 CameraPosition;
@@ -26,15 +28,12 @@ namespace
 		float VerticalFov;
 		float Exposure;
 		uint32_t SphereCount;
-		glm::vec4 LightPositionIntensity;
-		glm::vec4 LightColor;
-		glm::vec4 LightSizePadding;
-		glm::uvec4 TraversalSettings;
+		glm::uvec4 SceneSettings;
 	};
 
-	// Vulkan guarantees at least 128 bytes of push constant space, so this still
-	// fits on every device without moving the data into a buffer.
-	static_assert(sizeof(PushConstants) == 112);
+	// Moving the light out of the push constant and into a storage buffer took
+	// this back down to 64 bytes, half of the 128 bytes Vulkan guarantees.
+	static_assert(sizeof(PushConstants) == 64);
 
 	struct alignas(16) GpuSphere
 	{
@@ -56,6 +55,17 @@ namespace
 	};
 
 	static_assert(sizeof(GpuBvhNode) == 48);
+
+	// The same three-vec4 packing the spheres use. Position and intensity share
+	// one vec4 because std430 would pad a lone vec3 out to 16 bytes anyway.
+	struct alignas(16) GpuAreaLight
+	{
+		glm::vec4 PositionIntensity;
+		glm::vec4 Color;
+		glm::vec4 SizePadding;
+	};
+
+	static_assert(sizeof(GpuAreaLight) == 48);
 
 	constexpr uint32_t BvhLeafSphereCount = 2;
 
@@ -288,6 +298,7 @@ void ComputeRenderer::CreateSceneBuffer()
 	CreateHostBuffer(bufferSize, m_SphereBuffer, m_SphereBufferMemory);
 
 	CreateBvhBuffer();
+	CreateLightBuffer();
 	UploadSceneBuffer();
 }
 
@@ -295,6 +306,28 @@ void ComputeRenderer::CreateBvhBuffer()
 {
 	const VkDeviceSize bufferSize = sizeof(GpuBvhNode) * MaxBvhNodeCount;
 	CreateHostBuffer(bufferSize, m_BvhBuffer, m_BvhBufferMemory);
+}
+
+void ComputeRenderer::CreateLightBuffer()
+{
+	// A warm key light on one side and a dimmer cool fill on the other, so the
+	// scene shows two distinct shadow directions out of the box.
+	m_Lights = {
+		AreaLight{
+			{ -2.5f, 5.0f, 2.0f },
+			{ 1.0f, 0.95f, 0.85f },
+			{ 3.0f, 3.0f },
+			24.0f },
+		AreaLight{
+			{ 3.5f, 4.0f, -2.0f },
+			{ 0.45f, 0.6f, 1.0f },
+			{ 2.0f, 2.0f },
+			12.0f }
+	};
+
+	const VkDeviceSize bufferSize = sizeof(GpuAreaLight) * MaxLightCount;
+	CreateHostBuffer(bufferSize, m_LightBuffer, m_LightBufferMemory);
+	UploadLightBuffer();
 }
 
 // Both scene buffers are small and rewritten whenever the scene changes, so
@@ -468,6 +501,22 @@ void ComputeRenderer::UploadSceneBuffer()
 	WriteHostBuffer(m_SphereBufferMemory, gpuSpheres.data(), sizeof(gpuSpheres));
 }
 
+void ComputeRenderer::UploadLightBuffer()
+{
+	std::array<GpuAreaLight, MaxLightCount> gpuLights{};
+	for (size_t lightIndex = 0; lightIndex < m_Lights.size(); lightIndex++)
+	{
+		const AreaLight& light = m_Lights[lightIndex];
+		gpuLights[lightIndex].PositionIntensity =
+			glm::vec4(light.Position, light.Intensity);
+		gpuLights[lightIndex].Color = glm::vec4(light.Color, 0.0f);
+		gpuLights[lightIndex].SizePadding =
+			glm::vec4(light.Size, 0.0f, 0.0f);
+	}
+
+	WriteHostBuffer(m_LightBufferMemory, gpuLights.data(), sizeof(gpuLights));
+}
+
 const ComputeRenderer::Sphere& ComputeRenderer::GetSphere(uint32_t index) const
 {
 	return m_Spheres.at(index);
@@ -535,7 +584,7 @@ bool ComputeRenderer::SaveScene(
 	}
 
 	file << std::setprecision(std::numeric_limits<float>::max_digits10);
-	file << "WALNUT_RAY_SCENE 1\n";
+	file << "WALNUT_RAY_SCENE 2\n";
 	file << "SPHERE_COUNT " << m_Spheres.size() << '\n';
 	for (const Sphere& sphere : m_Spheres)
 	{
@@ -550,16 +599,20 @@ bool ComputeRenderer::SaveScene(
 			<< sphere.Reflectivity << ' '
 			<< sphere.Roughness << '\n';
 	}
-	file << "LIGHT "
-		<< m_AreaLight.Position.x << ' '
-		<< m_AreaLight.Position.y << ' '
-		<< m_AreaLight.Position.z << ' '
-		<< m_AreaLight.Color.r << ' '
-		<< m_AreaLight.Color.g << ' '
-		<< m_AreaLight.Color.b << ' '
-		<< m_AreaLight.Size.x << ' '
-		<< m_AreaLight.Size.y << ' '
-		<< m_AreaLight.Intensity << '\n';
+	file << "LIGHT_COUNT " << m_Lights.size() << '\n';
+	for (const AreaLight& light : m_Lights)
+	{
+		file << "LIGHT "
+			<< light.Position.x << ' '
+			<< light.Position.y << ' '
+			<< light.Position.z << ' '
+			<< light.Color.r << ' '
+			<< light.Color.g << ' '
+			<< light.Color.b << ' '
+			<< light.Size.x << ' '
+			<< light.Size.y << ' '
+			<< light.Intensity << '\n';
+	}
 	file.flush();
 
 	if (!file)
@@ -587,7 +640,7 @@ bool ComputeRenderer::LoadScene(
 	uint32_t version = 0;
 	if (!(file >> label >> version) ||
 		label != "WALNUT_RAY_SCENE" ||
-		version != 1)
+		(version != 1 && version != 2))
 	{
 		errorMessage = "Scene header or version is invalid.";
 		return false;
@@ -633,26 +686,49 @@ bool ComputeRenderer::LoadScene(
 		loadedSpheres.push_back(SanitizeSphere(sphere));
 	}
 
-	AreaLight loadedLight{};
-	if (!(file >> label) || label != "LIGHT" ||
-		!(file
-			>> loadedLight.Position.x
-			>> loadedLight.Position.y
-			>> loadedLight.Position.z
-			>> loadedLight.Color.r
-			>> loadedLight.Color.g
-			>> loadedLight.Color.b
-			>> loadedLight.Size.x
-			>> loadedLight.Size.y
-			>> loadedLight.Intensity))
+	// Version 1 stored exactly one light and no count line, so older scene files
+	// still load and simply come back as a one light scene.
+	uint64_t lightCount = 1;
+	if (version >= 2)
 	{
-		errorMessage = "Area light data is missing or invalid.";
-		return false;
+		if (!(file >> label >> lightCount) || label != "LIGHT_COUNT")
+		{
+			errorMessage = "Light count is missing or invalid.";
+			return false;
+		}
+		if (lightCount > MaxLightCount)
+		{
+			errorMessage = "Scene exceeds the light capacity.";
+			return false;
+		}
 	}
-	if (!IsFinite(loadedLight))
+
+	std::vector<AreaLight> loadedLights;
+	loadedLights.reserve(static_cast<size_t>(lightCount));
+	for (uint64_t lightIndex = 0; lightIndex < lightCount; lightIndex++)
 	{
-		errorMessage = "Area light data contains a non-finite number.";
-		return false;
+		AreaLight loadedLight{};
+		if (!(file >> label) || label != "LIGHT" ||
+			!(file
+				>> loadedLight.Position.x
+				>> loadedLight.Position.y
+				>> loadedLight.Position.z
+				>> loadedLight.Color.r
+				>> loadedLight.Color.g
+				>> loadedLight.Color.b
+				>> loadedLight.Size.x
+				>> loadedLight.Size.y
+				>> loadedLight.Intensity))
+		{
+			errorMessage = "Area light data is missing or invalid.";
+			return false;
+		}
+		if (!IsFinite(loadedLight))
+		{
+			errorMessage = "Area light data contains a non-finite number.";
+			return false;
+		}
+		loadedLights.push_back(SanitizeAreaLight(loadedLight));
 	}
 
 	std::string unexpectedData;
@@ -663,16 +739,50 @@ bool ComputeRenderer::LoadScene(
 	}
 
 	m_Spheres = std::move(loadedSpheres);
-	m_AreaLight = SanitizeAreaLight(loadedLight);
+	m_Lights = std::move(loadedLights);
 	UploadSceneBuffer();
+	UploadLightBuffer();
 	ResetAccumulation();
 	return true;
 }
 
-void ComputeRenderer::SetAreaLight(const AreaLight& light)
+const ComputeRenderer::AreaLight& ComputeRenderer::GetLight(uint32_t index) const
 {
-	m_AreaLight = SanitizeAreaLight(light);
+	return m_Lights.at(index);
+}
+
+void ComputeRenderer::SetLight(uint32_t index, const AreaLight& light)
+{
+	m_Lights.at(index) = SanitizeAreaLight(light);
+	UploadLightBuffer();
 	ResetAccumulation();
+}
+
+bool ComputeRenderer::AddLight()
+{
+	if (m_Lights.size() >= MaxLightCount)
+		return false;
+
+	m_Lights.push_back({
+		{ 0.0f, 5.0f, 0.0f },
+		{ 1.0f, 1.0f, 1.0f },
+		{ 2.0f, 2.0f },
+		15.0f
+	});
+	UploadLightBuffer();
+	ResetAccumulation();
+	return true;
+}
+
+bool ComputeRenderer::RemoveLight(uint32_t index)
+{
+	if (index >= m_Lights.size())
+		return false;
+
+	m_Lights.erase(m_Lights.begin() + index);
+	UploadLightBuffer();
+	ResetAccumulation();
+	return true;
 }
 
 uint32_t ComputeRenderer::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const
@@ -928,7 +1038,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 {
 	VkDevice device = Walnut::Application::GetDevice();
 
-	VkDescriptorSetLayoutBinding descriptorBindings[4]{};
+	VkDescriptorSetLayoutBinding descriptorBindings[5]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorBindings[bindingIndex].binding = bindingIndex;
@@ -936,7 +1046,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorBindings[bindingIndex].descriptorCount = 1;
 		descriptorBindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 	}
-	for (uint32_t bindingIndex = 2; bindingIndex < 4; bindingIndex++)
+	for (uint32_t bindingIndex = 2; bindingIndex < 5; bindingIndex++)
 	{
 		descriptorBindings[bindingIndex].binding = bindingIndex;
 		descriptorBindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -946,7 +1056,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 4;
+	layoutInfo.bindingCount = 5;
 	layoutInfo.pBindings = descriptorBindings;
 	check_vk_result(vkCreateDescriptorSetLayout(
 		device, &layoutInfo, nullptr, &m_ComputeDescriptorSetLayout));
@@ -955,7 +1065,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	poolSizes[0].descriptorCount = 2;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSizes[1].descriptorCount = 2;
+	poolSizes[1].descriptorCount = 3;
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -978,15 +1088,18 @@ void ComputeRenderer::CreateComputeDescriptors()
 	descriptorImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 	descriptorImages[1].imageView = m_AccumulationImageView;
 	descriptorImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-	VkDescriptorBufferInfo descriptorBuffers[2]{};
+	VkDescriptorBufferInfo descriptorBuffers[3]{};
 	descriptorBuffers[0].buffer = m_SphereBuffer;
 	descriptorBuffers[0].offset = 0;
 	descriptorBuffers[0].range = VK_WHOLE_SIZE;
 	descriptorBuffers[1].buffer = m_BvhBuffer;
 	descriptorBuffers[1].offset = 0;
 	descriptorBuffers[1].range = VK_WHOLE_SIZE;
+	descriptorBuffers[2].buffer = m_LightBuffer;
+	descriptorBuffers[2].offset = 0;
+	descriptorBuffers[2].range = VK_WHOLE_SIZE;
 
-	VkWriteDescriptorSet descriptorWrites[4]{};
+	VkWriteDescriptorSet descriptorWrites[5]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorWrites[bindingIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -996,7 +1109,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorWrites[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 		descriptorWrites[bindingIndex].pImageInfo = &descriptorImages[bindingIndex];
 	}
-	for (uint32_t bindingIndex = 2; bindingIndex < 4; bindingIndex++)
+	for (uint32_t bindingIndex = 2; bindingIndex < 5; bindingIndex++)
 	{
 		descriptorWrites[bindingIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 		descriptorWrites[bindingIndex].dstSet = m_ComputeDescriptorSet;
@@ -1005,7 +1118,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorWrites[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 		descriptorWrites[bindingIndex].pBufferInfo = &descriptorBuffers[bindingIndex - 2];
 	}
-	vkUpdateDescriptorSets(device, 4, descriptorWrites, 0, nullptr);
+	vkUpdateDescriptorSets(device, 5, descriptorWrites, 0, nullptr);
 }
 
 void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)
@@ -1064,16 +1177,11 @@ void ComputeRenderer::Render()
 	pushConstants.VerticalFov = m_VerticalFov;
 	pushConstants.Exposure = m_Exposure;
 	pushConstants.SphereCount = GetSphereCount();
-	pushConstants.LightPositionIntensity = glm::vec4(
-		m_AreaLight.Position,
-		m_AreaLight.Intensity);
-	pushConstants.LightColor = glm::vec4(m_AreaLight.Color, 0.0f);
-	pushConstants.LightSizePadding = glm::vec4(m_AreaLight.Size, 0.0f, 0.0f);
 	// A node count of zero would leave the shader without a root to start from,
 	// so the brute force loop stays as the fallback.
 	const bool traverseBvh = m_UseBvh && m_BvhNodeCount > 0;
-	pushConstants.TraversalSettings =
-		glm::uvec4(traverseBvh ? 1u : 0u, m_BvhNodeCount, 0, 0);
+	pushConstants.SceneSettings =
+		glm::uvec4(traverseBvh ? 1u : 0u, GetLightCount(), 0, 0);
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
@@ -1199,6 +1307,8 @@ void ComputeRenderer::Release()
 	VkDeviceMemory sphereBufferMemory = m_SphereBufferMemory;
 	VkBuffer bvhBuffer = m_BvhBuffer;
 	VkDeviceMemory bvhBufferMemory = m_BvhBufferMemory;
+	VkBuffer lightBuffer = m_LightBuffer;
+	VkDeviceMemory lightBufferMemory = m_LightBufferMemory;
 	VkQueryPool timestampQueryPool = m_TimestampQueryPool;
 
 	Walnut::Application::SubmitResourceFree(
@@ -1206,7 +1316,7 @@ void ComputeRenderer::Release()
 		 sampler, outputImageView, outputImage, outputImageMemory,
 		 accumulationImageView, accumulationImage, accumulationImageMemory,
 		 sphereBuffer, sphereBufferMemory, bvhBuffer, bvhBufferMemory,
-		 timestampQueryPool]()
+		 lightBuffer, lightBufferMemory, timestampQueryPool]()
 		{
 			VkDevice device = Walnut::Application::GetDevice();
 			if (timestampQueryPool != VK_NULL_HANDLE)
@@ -1226,6 +1336,8 @@ void ComputeRenderer::Release()
 			vkFreeMemory(device, sphereBufferMemory, nullptr);
 			vkDestroyBuffer(device, bvhBuffer, nullptr);
 			vkFreeMemory(device, bvhBufferMemory, nullptr);
+			vkDestroyBuffer(device, lightBuffer, nullptr);
+			vkFreeMemory(device, lightBufferMemory, nullptr);
 		});
 
 	m_OutputImage = VK_NULL_HANDLE;

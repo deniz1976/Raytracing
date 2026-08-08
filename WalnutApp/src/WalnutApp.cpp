@@ -174,6 +174,16 @@ public:
 					m_SelectedSphereIndex =
 						static_cast<int>(loadedSphereCount) - 1;
 				}
+
+				const uint32_t loadedLightCount = m_Renderer.GetLightCount();
+				if (loadedLightCount == 0)
+					m_SelectedLightIndex = 0;
+				else if (m_SelectedLightIndex >=
+					static_cast<int>(loadedLightCount))
+				{
+					m_SelectedLightIndex =
+						static_cast<int>(loadedLightCount) - 1;
+				}
 			}
 			else
 			{
@@ -264,30 +274,79 @@ public:
 		ImGui::End();
 
 		ImGui::Begin("Light Controls");
-		ComputeRenderer::AreaLight light = m_Renderer.GetAreaLight();
-		bool lightChanged = false;
-		lightChanged |= ImGui::DragFloat3(
-			"Position",
-			&light.Position.x,
-			0.05f);
-		lightChanged |= ImGui::ColorEdit3(
-			"Color",
-			&light.Color.x);
-		lightChanged |= ImGui::DragFloat2(
-			"Size",
-			&light.Size.x,
-			0.05f,
-			0.05f,
-			20.0f);
-		lightChanged |= ImGui::DragFloat(
-			"Intensity",
-			&light.Intensity,
-			0.1f,
-			0.0f,
-			100.0f);
 
-		if (lightChanged)
-			m_Renderer.SetAreaLight(light);
+		uint32_t lightCount = m_Renderer.GetLightCount();
+		ImGui::Text(
+			"Lights: %u / %u",
+			lightCount,
+			ComputeRenderer::MaxLightCount);
+
+		if (lightCount < ComputeRenderer::MaxLightCount &&
+			ImGui::Button("Add Light"))
+		{
+			if (m_Renderer.AddLight())
+				m_SelectedLightIndex =
+					static_cast<int>(m_Renderer.GetLightCount()) - 1;
+		}
+
+		lightCount = m_Renderer.GetLightCount();
+		if (lightCount > 0)
+		{
+			ImGui::SameLine();
+			if (ImGui::Button("Remove Selected Light"))
+			{
+				m_Renderer.RemoveLight(
+					static_cast<uint32_t>(m_SelectedLightIndex));
+				lightCount = m_Renderer.GetLightCount();
+				if (lightCount == 0)
+					m_SelectedLightIndex = 0;
+				else if (m_SelectedLightIndex >= static_cast<int>(lightCount))
+					m_SelectedLightIndex = static_cast<int>(lightCount) - 1;
+			}
+		}
+
+		if (lightCount == 0)
+		{
+			ImGui::Text("No lights in the scene. Only ambient light remains.");
+		}
+		else
+		{
+			ImGui::SliderInt(
+				"Light Index",
+				&m_SelectedLightIndex,
+				0,
+				static_cast<int>(lightCount) - 1);
+
+			ComputeRenderer::AreaLight light = m_Renderer.GetLight(
+				static_cast<uint32_t>(m_SelectedLightIndex));
+			bool lightChanged = false;
+			lightChanged |= ImGui::DragFloat3(
+				"Position",
+				&light.Position.x,
+				0.05f);
+			lightChanged |= ImGui::ColorEdit3(
+				"Color",
+				&light.Color.x);
+			lightChanged |= ImGui::DragFloat2(
+				"Size",
+				&light.Size.x,
+				0.05f,
+				0.05f,
+				20.0f);
+			lightChanged |= ImGui::DragFloat(
+				"Intensity",
+				&light.Intensity,
+				0.1f,
+				0.0f,
+				100.0f);
+
+			if (lightChanged)
+			{
+				m_Renderer.SetLight(
+					static_cast<uint32_t>(m_SelectedLightIndex),
+					light);
+			}
+		}
 
 		ImGui::End();
 
@@ -418,6 +477,7 @@ private:
 	bool m_HasMousePosition = false;
 	bool m_MouseLookEnabled = false;
 	int m_SelectedSphereIndex = 0;
+	int m_SelectedLightIndex = 0;
 	std::string m_SceneStatus;
 };
 
