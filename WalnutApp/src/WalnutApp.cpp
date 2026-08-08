@@ -341,6 +341,18 @@ public:
 		}
 
 		ImGui::Separator();
+		bool bvhEnabled = m_Renderer.IsBvhEnabled();
+		// The tree only changes how the spheres are searched, never the image,
+		// so toggling it keeps the accumulated samples and the two modes can be
+		// compared without waiting for the picture to converge again.
+		if (ImGui::Checkbox("Use BVH", &bvhEnabled))
+			m_Renderer.SetBvhEnabled(bvhEnabled);
+		ImGui::Text(
+			"BVH nodes: %u (depth %u)",
+			m_Renderer.GetBvhNodeCount(),
+			m_Renderer.GetBvhDepth());
+
+		ImGui::Separator();
 		ImGui::Text(
 			"Resolution: %u x %u",
 			m_Renderer.GetWidth(),
@@ -354,7 +366,8 @@ public:
 			"submission and the fence wait. Because compute and present share "
 			"one queue and the swapchain is vsync limited, that wait absorbs "
 			"the wait for the display, so CPU render time stays near the frame "
-			"time even when the dispatch is much shorter.");
+			"time even when the dispatch is much shorter. Turn the BVH off to "
+			"compare the tree against testing every sphere.");
 		ImGui::End();
 	}
 

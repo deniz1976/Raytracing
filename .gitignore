@@ -12,6 +12,7 @@ bin-int/
 imgui.ini
 LEARNING_NOTES.local.md
 PROJECT_HANDOFF.local.md
+*.local.txt
 WalnutApp/assets/scenes/*.local.scene
 
 # Exclude

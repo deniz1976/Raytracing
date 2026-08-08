@@ -17,6 +17,21 @@ layout(std430, set = 0, binding = 2) readonly buffer SphereBuffer
 	SphereData Spheres[];
 } u_SphereBuffer;
 
+// Links.x is the left child of an interior node or the first sphere of a leaf,
+// Links.y is the right child, Links.z is the sphere count. A count of zero marks
+// an interior node.
+struct BvhNodeData
+{
+	vec4 BoundsMin;
+	vec4 BoundsMax;
+	uvec4 Links;
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer BvhBuffer
+{
+	BvhNodeData Nodes[];
+} u_BvhBuffer;
+
 layout(push_constant) uniform PushConstants
 {
 	vec4 CameraPosition;
@@ -28,10 +43,15 @@ layout(push_constant) uniform PushConstants
 	vec4 LightPositionIntensity;
 	vec4 LightColor;
 	vec4 LightSizePadding;
+	uvec4 TraversalSettings;
 } u_PushConstants;
 
 const int MAX_BOUNCES = 3;
 const float RAY_EPSILON = 0.001;
+
+// A median split tree over the 512 sphere capacity stays about ten levels deep,
+// so this stack has plenty of headroom; pushes are still guarded.
+const int BVH_STACK_SIZE = 32;
 
 struct Ray
 {
@@ -132,16 +152,65 @@ float HitSphere(Ray ray, SphereData sphere)
 	return -1.0;
 }
 
-bool TraceScene(
+// A zero direction component would turn into an infinite reciprocal, and the
+// infinity multiplied by a zero distance would produce a NaN that breaks the
+// comparisons below. Clamping to a large finite number avoids that entirely.
+vec3 SafeInverseDirection(vec3 direction)
+{
+	const float largeValue = 1e30;
+	vec3 inverseDirection;
+
+	for (int axis = 0; axis < 3; axis++)
+	{
+		inverseDirection[axis] = abs(direction[axis]) > 1e-8
+			? 1.0 / direction[axis]
+			: (direction[axis] < 0.0 ? -largeValue : largeValue);
+	}
+
+	return inverseDirection;
+}
+
+// Slab test. Each axis gives the distance range in which the ray is inside that
+// pair of parallel planes. The ray touches the box when the three ranges
+// overlap, so the largest entry distance must not exceed the smallest exit
+// distance. maximumDistance discards boxes that are farther than the closest
+// surface found so far.
+bool HitAabb(
+	vec3 rayOrigin,
+	vec3 inverseDirection,
+	vec3 boundsMin,
+	vec3 boundsMax,
+	float maximumDistance)
+{
+	vec3 firstPlane = (boundsMin - rayOrigin) * inverseDirection;
+	vec3 secondPlane = (boundsMax - rayOrigin) * inverseDirection;
+
+	vec3 nearPlanes = min(firstPlane, secondPlane);
+	vec3 farPlanes = max(firstPlane, secondPlane);
+
+	float entryDistance = max(
+		max(nearPlanes.x, nearPlanes.y),
+		max(nearPlanes.z, 0.0));
+	float exitDistance = min(
+		min(farPlanes.x, farPlanes.y),
+		farPlanes.z);
+
+	return entryDistance <= exitDistance && entryDistance < maximumDistance;
+}
+
+// Tests one contiguous run of the sphere buffer and keeps the nearest hit. The
+// spheres are uploaded in tree order, so a leaf owns such a run.
+bool IntersectSphereRange(
 	Ray ray,
-	out HitRecord closestHit)
+	uint firstSphere,
+	uint sphereCount,
+	inout HitRecord closestHit)
 {
 	bool hitAnything = false;
-	closestHit.Distance = 1e30;
 
-	for (uint sphereIndex = 0; sphereIndex < u_PushConstants.SphereCount; sphereIndex++)
+	for (uint offset = 0; offset < sphereCount; offset++)
 	{
-		SphereData sphere = u_SphereBuffer.Spheres[sphereIndex];
+		SphereData sphere = u_SphereBuffer.Spheres[firstSphere + offset];
 		float hitDistance = HitSphere(ray, sphere);
 
 		if (hitDistance > 0.0 && hitDistance < closestHit.Distance)
@@ -158,6 +227,65 @@ bool TraceScene(
 	return hitAnything;
 }
 
+bool TraceScene(
+	Ray ray,
+	out HitRecord closestHit)
+{
+	closestHit.Distance = 1e30;
+
+	if (u_PushConstants.TraversalSettings.x == 0u)
+	{
+		return IntersectSphereRange(
+			ray,
+			0u,
+			u_PushConstants.SphereCount,
+			closestHit);
+	}
+
+	bool hitAnything = false;
+	vec3 inverseDirection = SafeInverseDirection(ray.Direction);
+
+	uint nodeStack[BVH_STACK_SIZE];
+	int stackSize = 0;
+	nodeStack[stackSize++] = 0u;
+
+	while (stackSize > 0)
+	{
+		BvhNodeData node = u_BvhBuffer.Nodes[nodeStack[--stackSize]];
+
+		if (!HitAabb(
+			ray.Origin,
+			inverseDirection,
+			node.BoundsMin.xyz,
+			node.BoundsMax.xyz,
+			closestHit.Distance))
+		{
+			continue;
+		}
+
+		if (node.Links.z > 0u)
+		{
+			if (IntersectSphereRange(
+				ray,
+				node.Links.x,
+				node.Links.z,
+				closestHit))
+			{
+				hitAnything = true;
+			}
+			continue;
+		}
+
+		if (stackSize + 2 <= BVH_STACK_SIZE)
+		{
+			nodeStack[stackSize++] = node.Links.y;
+			nodeStack[stackSize++] = node.Links.x;
+		}
+	}
+
+	return hitAnything;
+}
+
 bool IsOccluded(
 	vec3 surfacePosition,
 	vec3 surfaceNormal,
@@ -168,14 +296,62 @@ bool IsOccluded(
 	shadowRay.Origin = surfacePosition + surfaceNormal * RAY_EPSILON;
 	shadowRay.Direction = directionToLight;
 
-	for (uint sphereIndex = 0; sphereIndex < u_PushConstants.SphereCount; sphereIndex++)
+	if (u_PushConstants.TraversalSettings.x == 0u)
 	{
-		float hitDistance = HitSphere(
-			shadowRay,
-			u_SphereBuffer.Spheres[sphereIndex]);
-		if (hitDistance > 0.0 &&
-			hitDistance < maximumDistance - RAY_EPSILON)
-			return true;
+		for (uint sphereIndex = 0; sphereIndex < u_PushConstants.SphereCount; sphereIndex++)
+		{
+			float hitDistance = HitSphere(
+				shadowRay,
+				u_SphereBuffer.Spheres[sphereIndex]);
+			if (hitDistance > 0.0 &&
+				hitDistance < maximumDistance - RAY_EPSILON)
+				return true;
+		}
+
+		return false;
+	}
+
+	vec3 inverseDirection = SafeInverseDirection(shadowRay.Direction);
+
+	uint nodeStack[BVH_STACK_SIZE];
+	int stackSize = 0;
+	nodeStack[stackSize++] = 0u;
+
+	while (stackSize > 0)
+	{
+		BvhNodeData node = u_BvhBuffer.Nodes[nodeStack[--stackSize]];
+
+		if (!HitAabb(
+			shadowRay.Origin,
+			inverseDirection,
+			node.BoundsMin.xyz,
+			node.BoundsMax.xyz,
+			maximumDistance))
+		{
+			continue;
+		}
+
+		if (node.Links.z > 0u)
+		{
+			// A shadow ray only needs to know whether anything blocks it, so the
+			// first hit ends the search instead of looking for the nearest one.
+			for (uint offset = 0; offset < node.Links.z; offset++)
+			{
+				float hitDistance = HitSphere(
+					shadowRay,
+					u_SphereBuffer.Spheres[node.Links.x + offset]);
+				if (hitDistance > 0.0 &&
+					hitDistance < maximumDistance - RAY_EPSILON)
+					return true;
+			}
+			continue;
+		}
+
+		if (stackSize + 2 <= BVH_STACK_SIZE)
+		{
+			nodeStack[stackSize++] = node.Links.y;
+			nodeStack[stackSize++] = node.Links.x;
+		}
 	}
 
 	return false;

@@ -27,7 +27,11 @@ public:
 		float Intensity;
 	};
 
-	static constexpr uint32_t MaxSphereCount = 64;
+	static constexpr uint32_t MaxSphereCount = 512;
+
+	// A binary tree over N primitives needs at most 2N-1 nodes, so this capacity
+	// can always hold a tree built over MaxSphereCount spheres.
+	static constexpr uint32_t MaxBvhNodeCount = 2 * MaxSphereCount;
 
 	~ComputeRenderer();
 
@@ -47,6 +51,8 @@ public:
 	bool LoadScene(const std::string& path, std::string& errorMessage);
 	const AreaLight& GetAreaLight() const { return m_AreaLight; }
 	void SetAreaLight(const AreaLight& light);
+	void SetBvhEnabled(bool enabled) { m_UseBvh = enabled; }
+	bool IsBvhEnabled() const { return m_UseBvh; }
 	void ResetAccumulation();
 
 	VkDescriptorSet GetImageDescriptorSet() const { return m_ImGuiDescriptorSet; }
@@ -54,6 +60,8 @@ public:
 	uint32_t GetHeight() const { return m_Height; }
 	uint32_t GetFrameIndex() const { return m_FrameIndex; }
 	uint32_t GetSphereCount() const { return static_cast<uint32_t>(m_Spheres.size()); }
+	uint32_t GetBvhNodeCount() const { return m_BvhNodeCount; }
+	uint32_t GetBvhDepth() const { return m_BvhDepth; }
 	float GetCpuRenderTimeMs() const { return m_CpuRenderTimeMs; }
 	float GetGpuComputeTimeMs() const { return m_GpuComputeTimeMs; }
 	bool AreGpuTimestampsSupported() const { return m_TimestampQueryPool != VK_NULL_HANDLE; }
@@ -70,7 +78,17 @@ private:
 	void UpdateComputeImageDescriptors();
 	void UpdateImGuiImageDescriptor();
 	void CreateSceneBuffer();
+	void CreateBvhBuffer();
+	void CreateHostBuffer(
+		VkDeviceSize size,
+		VkBuffer& buffer,
+		VkDeviceMemory& memory) const;
+	void WriteHostBuffer(
+		VkDeviceMemory memory,
+		const void* data,
+		VkDeviceSize size) const;
 	void UploadSceneBuffer();
+	void BuildBvh();
 	void CreateComputeDescriptors();
 	void CreateComputePipeline(const std::string& shaderPath);
 	void CreateTimestampQueryPool();
@@ -95,8 +113,18 @@ private:
 		24.0f
 	};
 
+	bool m_UseBvh = true;
+	// Spheres are uploaded in BVH leaf order, so a leaf can point at a
+	// contiguous range of the GPU buffer instead of an indirection list.
+	std::vector<uint32_t> m_SphereOrder;
+	uint32_t m_BvhNodeCount = 0;
+	uint32_t m_BvhDepth = 0;
+
 	VkBuffer m_SphereBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_SphereBufferMemory = VK_NULL_HANDLE;
+
+	VkBuffer m_BvhBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_BvhBufferMemory = VK_NULL_HANDLE;
 
 	VkImage m_OutputImage = VK_NULL_HANDLE;
 	VkDeviceMemory m_OutputImageMemory = VK_NULL_HANDLE;

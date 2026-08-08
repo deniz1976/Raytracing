@@ -29,9 +29,12 @@ namespace
 		glm::vec4 LightPositionIntensity;
 		glm::vec4 LightColor;
 		glm::vec4 LightSizePadding;
+		glm::uvec4 TraversalSettings;
 	};
 
-	static_assert(sizeof(PushConstants) == 96);
+	// Vulkan guarantees at least 128 bytes of push constant space, so this still
+	// fits on every device without moving the data into a buffer.
+	static_assert(sizeof(PushConstants) == 112);
 
 	struct alignas(16) GpuSphere
 	{
@@ -41,6 +44,30 @@ namespace
 	};
 
 	static_assert(sizeof(GpuSphere) == 48);
+
+	// One node of the bounding volume hierarchy. An interior node stores the two
+	// child indices and a SphereCount of zero; a leaf stores the first sphere in
+	// the BVH ordered sphere buffer plus how many spheres belong to it.
+	struct alignas(16) GpuBvhNode
+	{
+		glm::vec4 BoundsMin;
+		glm::vec4 BoundsMax;
+		glm::uvec4 Links;
+	};
+
+	static_assert(sizeof(GpuBvhNode) == 48);
+
+	constexpr uint32_t BvhLeafSphereCount = 2;
+
+	// One pending subtree during the build: the slice of the sphere order array
+	// it owns, the node that describes it and how deep it sits in the tree.
+	struct BvhBuildEntry
+	{
+		uint32_t Start;
+		uint32_t Count;
+		uint32_t NodeIndex;
+		uint32_t Depth;
+	};
 
 	ComputeRenderer::Sphere SanitizeSphere(
 		const ComputeRenderer::Sphere& sphere)
@@ -258,19 +285,36 @@ void ComputeRenderer::CreateSceneBuffer()
 	};
 
 	const VkDeviceSize bufferSize = sizeof(GpuSphere) * MaxSphereCount;
+	CreateHostBuffer(bufferSize, m_SphereBuffer, m_SphereBufferMemory);
+
+	CreateBvhBuffer();
+	UploadSceneBuffer();
+}
+
+void ComputeRenderer::CreateBvhBuffer()
+{
+	const VkDeviceSize bufferSize = sizeof(GpuBvhNode) * MaxBvhNodeCount;
+	CreateHostBuffer(bufferSize, m_BvhBuffer, m_BvhBufferMemory);
+}
+
+// Both scene buffers are small and rewritten whenever the scene changes, so
+// they live in host visible memory and skip the staging buffer dance.
+void ComputeRenderer::CreateHostBuffer(
+	VkDeviceSize size,
+	VkBuffer& buffer,
+	VkDeviceMemory& memory) const
+{
 	VkDevice device = Walnut::Application::GetDevice();
 
 	VkBufferCreateInfo bufferInfo{};
 	bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-	bufferInfo.size = bufferSize;
+	bufferInfo.size = size;
 	bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 	bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	check_vk_result(vkCreateBuffer(
-		device, &bufferInfo, nullptr, &m_SphereBuffer));
+	check_vk_result(vkCreateBuffer(device, &bufferInfo, nullptr, &buffer));
 
 	VkMemoryRequirements memoryRequirements;
-	vkGetBufferMemoryRequirements(
-		device, m_SphereBuffer, &memoryRequirements);
+	vkGetBufferMemoryRequirements(device, buffer, &memoryRequirements);
 
 	VkMemoryAllocateInfo allocationInfo{};
 	allocationInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -280,19 +324,139 @@ void ComputeRenderer::CreateSceneBuffer()
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
 			VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 	check_vk_result(vkAllocateMemory(
-		device, &allocationInfo, nullptr, &m_SphereBufferMemory));
-	check_vk_result(vkBindBufferMemory(
-		device, m_SphereBuffer, m_SphereBufferMemory, 0));
+		device, &allocationInfo, nullptr, &memory));
+	check_vk_result(vkBindBufferMemory(device, buffer, memory, 0));
+}
 
-	UploadSceneBuffer();
+void ComputeRenderer::WriteHostBuffer(
+	VkDeviceMemory memory,
+	const void* data,
+	VkDeviceSize size) const
+{
+	VkDevice device = Walnut::Application::GetDevice();
+
+	void* mappedMemory = nullptr;
+	check_vk_result(vkMapMemory(device, memory, 0, size, 0, &mappedMemory));
+	std::memcpy(mappedMemory, data, static_cast<size_t>(size));
+	vkUnmapMemory(device, memory);
+}
+
+// Groups the spheres into a binary tree of axis aligned bounding boxes so a ray
+// can reject a whole branch with one box test instead of touching every sphere.
+// The split is a median split: the range is ordered by centroid along its widest
+// axis and cut in half. Splitting by index rather than by a spatial plane keeps
+// the tree balanced even when many centroids coincide.
+void ComputeRenderer::BuildBvh()
+{
+	const uint32_t sphereCount = GetSphereCount();
+
+	m_SphereOrder.resize(sphereCount);
+	for (uint32_t sphereIndex = 0; sphereIndex < sphereCount; sphereIndex++)
+		m_SphereOrder[sphereIndex] = sphereIndex;
+
+	m_BvhNodeCount = 0;
+	m_BvhDepth = 0;
+
+	std::array<GpuBvhNode, MaxBvhNodeCount> nodes{};
+
+	if (sphereCount > 0)
+	{
+		std::vector<BvhBuildEntry> pending;
+		pending.push_back({ 0, sphereCount, 0, 1 });
+		m_BvhNodeCount = 1;
+
+		while (!pending.empty())
+		{
+			const BvhBuildEntry entry = pending.back();
+			pending.pop_back();
+			m_BvhDepth = std::max(m_BvhDepth, entry.Depth);
+
+			glm::vec3 boundsMin(std::numeric_limits<float>::max());
+			glm::vec3 boundsMax(std::numeric_limits<float>::lowest());
+			glm::vec3 centroidMin(std::numeric_limits<float>::max());
+			glm::vec3 centroidMax(std::numeric_limits<float>::lowest());
+			for (uint32_t offset = 0; offset < entry.Count; offset++)
+			{
+				const Sphere& sphere =
+					m_Spheres[m_SphereOrder[entry.Start + offset]];
+				boundsMin = glm::min(
+					boundsMin, sphere.Center - glm::vec3(sphere.Radius));
+				boundsMax = glm::max(
+					boundsMax, sphere.Center + glm::vec3(sphere.Radius));
+				centroidMin = glm::min(centroidMin, sphere.Center);
+				centroidMax = glm::max(centroidMax, sphere.Center);
+			}
+
+			GpuBvhNode& node = nodes[entry.NodeIndex];
+			node.BoundsMin = glm::vec4(boundsMin, 0.0f);
+			node.BoundsMax = glm::vec4(boundsMax, 0.0f);
+
+			// Every split adds two nodes, so stop early enough that the fixed
+			// capacity can never be exceeded.
+			const bool canSplit =
+				entry.Count > BvhLeafSphereCount &&
+				m_BvhNodeCount + 2 <= MaxBvhNodeCount;
+			if (!canSplit)
+			{
+				node.Links = glm::uvec4(entry.Start, 0, entry.Count, 0);
+				continue;
+			}
+
+			const glm::vec3 centroidExtent = centroidMax - centroidMin;
+			uint32_t splitAxis = 0;
+			if (centroidExtent.y > centroidExtent[splitAxis])
+				splitAxis = 1;
+			if (centroidExtent.z > centroidExtent[splitAxis])
+				splitAxis = 2;
+
+			const auto rangeBegin = m_SphereOrder.begin() + entry.Start;
+			const auto rangeMiddle = rangeBegin + entry.Count / 2;
+			const auto rangeEnd = rangeBegin + entry.Count;
+			std::nth_element(
+				rangeBegin,
+				rangeMiddle,
+				rangeEnd,
+				[this, splitAxis](uint32_t leftIndex, uint32_t rightIndex)
+				{
+					return
+						m_Spheres[leftIndex].Center[splitAxis] <
+						m_Spheres[rightIndex].Center[splitAxis];
+				});
+
+			const uint32_t leftChildIndex = m_BvhNodeCount;
+			const uint32_t rightChildIndex = m_BvhNodeCount + 1;
+			m_BvhNodeCount += 2;
+
+			// A SphereCount of zero marks an interior node.
+			node.Links = glm::uvec4(leftChildIndex, rightChildIndex, 0, 0);
+
+			const uint32_t leftCount = entry.Count / 2;
+			pending.push_back({
+				entry.Start,
+				leftCount,
+				leftChildIndex,
+				entry.Depth + 1 });
+			pending.push_back({
+				entry.Start + leftCount,
+				entry.Count - leftCount,
+				rightChildIndex,
+				entry.Depth + 1 });
+		}
+	}
+
+	WriteHostBuffer(m_BvhBufferMemory, nodes.data(), sizeof(nodes));
 }
 
 void ComputeRenderer::UploadSceneBuffer()
 {
+	// The tree decides the order the spheres are stored in, so it has to be
+	// rebuilt before the sphere buffer is written.
+	BuildBvh();
+
 	std::array<GpuSphere, MaxSphereCount> gpuSpheres{};
 	for (size_t sphereIndex = 0; sphereIndex < m_Spheres.size(); sphereIndex++)
 	{
-		const Sphere& sphere = m_Spheres[sphereIndex];
+		const Sphere& sphere = m_Spheres[m_SphereOrder[sphereIndex]];
 		gpuSpheres[sphereIndex].CenterRadius =
 			glm::vec4(sphere.Center, sphere.Radius);
 		gpuSpheres[sphereIndex].AlbedoReflectivity =
@@ -301,22 +465,7 @@ void ComputeRenderer::UploadSceneBuffer()
 			glm::vec4(sphere.Roughness, 0.0f, 0.0f, 0.0f);
 	}
 
-	const VkDeviceSize bufferSize = sizeof(gpuSpheres);
-	VkDevice device = Walnut::Application::GetDevice();
-
-	void* mappedMemory = nullptr;
-	check_vk_result(vkMapMemory(
-		device,
-		m_SphereBufferMemory,
-		0,
-		bufferSize,
-		0,
-		&mappedMemory));
-	std::memcpy(
-		mappedMemory,
-		gpuSpheres.data(),
-		static_cast<size_t>(bufferSize));
-	vkUnmapMemory(device, m_SphereBufferMemory);
+	WriteHostBuffer(m_SphereBufferMemory, gpuSpheres.data(), sizeof(gpuSpheres));
 }
 
 const ComputeRenderer::Sphere& ComputeRenderer::GetSphere(uint32_t index) const
@@ -779,7 +928,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 {
 	VkDevice device = Walnut::Application::GetDevice();
 
-	VkDescriptorSetLayoutBinding descriptorBindings[3]{};
+	VkDescriptorSetLayoutBinding descriptorBindings[4]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorBindings[bindingIndex].binding = bindingIndex;
@@ -787,14 +936,17 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorBindings[bindingIndex].descriptorCount = 1;
 		descriptorBindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 	}
-	descriptorBindings[2].binding = 2;
-	descriptorBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	descriptorBindings[2].descriptorCount = 1;
-	descriptorBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	for (uint32_t bindingIndex = 2; bindingIndex < 4; bindingIndex++)
+	{
+		descriptorBindings[bindingIndex].binding = bindingIndex;
+		descriptorBindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		descriptorBindings[bindingIndex].descriptorCount = 1;
+		descriptorBindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	}
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 3;
+	layoutInfo.bindingCount = 4;
 	layoutInfo.pBindings = descriptorBindings;
 	check_vk_result(vkCreateDescriptorSetLayout(
 		device, &layoutInfo, nullptr, &m_ComputeDescriptorSetLayout));
@@ -803,7 +955,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	poolSizes[0].descriptorCount = 2;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSizes[1].descriptorCount = 1;
+	poolSizes[1].descriptorCount = 2;
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -826,12 +978,15 @@ void ComputeRenderer::CreateComputeDescriptors()
 	descriptorImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 	descriptorImages[1].imageView = m_AccumulationImageView;
 	descriptorImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-	VkDescriptorBufferInfo descriptorBuffer{};
-	descriptorBuffer.buffer = m_SphereBuffer;
-	descriptorBuffer.offset = 0;
-	descriptorBuffer.range = VK_WHOLE_SIZE;
+	VkDescriptorBufferInfo descriptorBuffers[2]{};
+	descriptorBuffers[0].buffer = m_SphereBuffer;
+	descriptorBuffers[0].offset = 0;
+	descriptorBuffers[0].range = VK_WHOLE_SIZE;
+	descriptorBuffers[1].buffer = m_BvhBuffer;
+	descriptorBuffers[1].offset = 0;
+	descriptorBuffers[1].range = VK_WHOLE_SIZE;
 
-	VkWriteDescriptorSet descriptorWrites[3]{};
+	VkWriteDescriptorSet descriptorWrites[4]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorWrites[bindingIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -841,13 +996,16 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorWrites[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 		descriptorWrites[bindingIndex].pImageInfo = &descriptorImages[bindingIndex];
 	}
-	descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	descriptorWrites[2].dstSet = m_ComputeDescriptorSet;
-	descriptorWrites[2].dstBinding = 2;
-	descriptorWrites[2].descriptorCount = 1;
-	descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	descriptorWrites[2].pBufferInfo = &descriptorBuffer;
-	vkUpdateDescriptorSets(device, 3, descriptorWrites, 0, nullptr);
+	for (uint32_t bindingIndex = 2; bindingIndex < 4; bindingIndex++)
+	{
+		descriptorWrites[bindingIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrites[bindingIndex].dstSet = m_ComputeDescriptorSet;
+		descriptorWrites[bindingIndex].dstBinding = bindingIndex;
+		descriptorWrites[bindingIndex].descriptorCount = 1;
+		descriptorWrites[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		descriptorWrites[bindingIndex].pBufferInfo = &descriptorBuffers[bindingIndex - 2];
+	}
+	vkUpdateDescriptorSets(device, 4, descriptorWrites, 0, nullptr);
 }
 
 void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)
@@ -911,6 +1069,11 @@ void ComputeRenderer::Render()
 		m_AreaLight.Intensity);
 	pushConstants.LightColor = glm::vec4(m_AreaLight.Color, 0.0f);
 	pushConstants.LightSizePadding = glm::vec4(m_AreaLight.Size, 0.0f, 0.0f);
+	// A node count of zero would leave the shader without a root to start from,
+	// so the brute force loop stays as the fallback.
+	const bool traverseBvh = m_UseBvh && m_BvhNodeCount > 0;
+	pushConstants.TraversalSettings =
+		glm::uvec4(traverseBvh ? 1u : 0u, m_BvhNodeCount, 0, 0);
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
@@ -1034,13 +1197,16 @@ void ComputeRenderer::Release()
 	VkDeviceMemory accumulationImageMemory = m_AccumulationImageMemory;
 	VkBuffer sphereBuffer = m_SphereBuffer;
 	VkDeviceMemory sphereBufferMemory = m_SphereBufferMemory;
+	VkBuffer bvhBuffer = m_BvhBuffer;
+	VkDeviceMemory bvhBufferMemory = m_BvhBufferMemory;
 	VkQueryPool timestampQueryPool = m_TimestampQueryPool;
 
 	Walnut::Application::SubmitResourceFree(
 		[pipeline, pipelineLayout, descriptorPool, descriptorSetLayout,
 		 sampler, outputImageView, outputImage, outputImageMemory,
 		 accumulationImageView, accumulationImage, accumulationImageMemory,
-		 sphereBuffer, sphereBufferMemory, timestampQueryPool]()
+		 sphereBuffer, sphereBufferMemory, bvhBuffer, bvhBufferMemory,
+		 timestampQueryPool]()
 		{
 			VkDevice device = Walnut::Application::GetDevice();
 			if (timestampQueryPool != VK_NULL_HANDLE)
@@ -1058,6 +1224,8 @@ void ComputeRenderer::Release()
 			vkFreeMemory(device, accumulationImageMemory, nullptr);
 			vkDestroyBuffer(device, sphereBuffer, nullptr);
 			vkFreeMemory(device, sphereBufferMemory, nullptr);
+			vkDestroyBuffer(device, bvhBuffer, nullptr);
+			vkFreeMemory(device, bvhBufferMemory, nullptr);
 		});
 
 	m_OutputImage = VK_NULL_HANDLE;
