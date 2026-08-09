@@ -365,13 +365,14 @@ public:
 			m_Renderer.Resize(viewportWidth, viewportHeight);
 			m_Renderer.Render();
 
+			// The shader already writes row 0 as the top of the scene, so the
+			// default UVs show it upright. Flipping them here as well would
+			// mirror the image a second time.
 			ImGui::Image(
 				(ImTextureID)m_Renderer.GetImageDescriptorSet(),
 				ImVec2(
 					static_cast<float>(m_Renderer.GetWidth()),
-					static_cast<float>(m_Renderer.GetHeight())),
-				ImVec2(0.0f, 1.0f),
-				ImVec2(1.0f, 0.0f));
+					static_cast<float>(m_Renderer.GetHeight())));
 		}
 		else
 		{

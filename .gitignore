@@ -13,6 +13,8 @@ imgui.ini
 LEARNING_NOTES.local.md
 PROJECT_HANDOFF.local.md
 *.local.txt
+*.local.png
+*.local.ps1
 WalnutApp/assets/scenes/*.local.scene
 
 # Exclude

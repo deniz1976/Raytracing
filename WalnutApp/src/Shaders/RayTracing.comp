@@ -549,6 +549,9 @@ void main()
 		(vec2(pixel) + vec2(0.5) + pixelJitter) /
 		vec2(imageSize);
 	vec2 screenPosition = uv * 2.0 - 1.0;
+	// Image rows grow downwards while world up is +Y, so this is the single
+	// place the two conventions are reconciled: row 0 becomes the top of the
+	// scene. The display path must not flip the image again.
 	screenPosition.y = -screenPosition.y;
 
 	float aspectRatio = float(imageSize.x) / float(imageSize.y);
