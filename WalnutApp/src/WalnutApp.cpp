@@ -20,7 +20,6 @@ public:
 	virtual void OnAttach() override
 	{
 		m_Renderer.Init("assets/shaders/RayTracing.comp.spv", 1600, 900);
-		UpdateCamera();
 	}
 
 	virtual void OnDetach() override
@@ -40,7 +39,10 @@ public:
 		}
 
 		bool cameraChanged = false;
-		const glm::vec3 forward = CalculateCameraForward();
+		ComputeRenderer::Camera camera = m_Renderer.GetCamera();
+		// The renderer already derives this from the current yaw and pitch, so
+		// the movement directions never disagree with the traced view.
+		const glm::vec3 forward = m_Renderer.GetCameraForward();
 		const glm::vec3 right = glm::normalize(glm::cross(
 			forward,
 			glm::vec3(0.0f, 1.0f, 0.0f)));
@@ -57,7 +59,7 @@ public:
 
 		if (glm::dot(movement, movement) > 0.0f)
 		{
-			m_CameraPosition +=
+			camera.Position +=
 				glm::normalize(movement) *
 				m_CameraMoveSpeed *
 				timeStep;
@@ -77,38 +79,42 @@ public:
 
 			if (glm::dot(mouseDelta, mouseDelta) > 0.0f)
 			{
-				m_CameraYaw += mouseDelta.x * m_MouseSensitivity;
-				m_CameraPitch -= mouseDelta.y * m_MouseSensitivity;
-				m_CameraPitch = glm::clamp(m_CameraPitch, -89.0f, 89.0f);
+				camera.Yaw += mouseDelta.x * m_MouseSensitivity;
+				camera.Pitch -= mouseDelta.y * m_MouseSensitivity;
 				cameraChanged = true;
 			}
 		}
 
+		// SetCamera clamps the pitch, so the look direction can never flip over
+		// the top even though the mouse delta is unbounded.
 		if (cameraChanged)
-			UpdateCamera();
+			m_Renderer.SetCamera(camera);
 	}
 
 	virtual void OnUIRender() override
 	{
 		ImGui::Begin("Camera and Render Controls");
 
+		// Read back every frame instead of mirroring the values here, so a scene
+		// load shows up in these controls without any extra bookkeeping.
+		ComputeRenderer::Camera camera = m_Renderer.GetCamera();
 		bool cameraChanged = false;
 		cameraChanged |= ImGui::DragFloat3(
 			"Position",
-			&m_CameraPosition.x,
+			&camera.Position.x,
 			0.05f);
 		cameraChanged |= ImGui::DragFloat(
 			"Yaw",
-			&m_CameraYaw,
+			&camera.Yaw,
 			0.5f);
 		cameraChanged |= ImGui::SliderFloat(
 			"Pitch",
-			&m_CameraPitch,
+			&camera.Pitch,
 			-89.0f,
 			89.0f);
 		cameraChanged |= ImGui::SliderFloat(
 			"Vertical FOV",
-			&m_VerticalFov,
+			&camera.VerticalFov,
 			20.0f,
 			90.0f);
 
@@ -123,10 +129,7 @@ public:
 
 		if (ImGui::Button("Reset Camera"))
 		{
-			m_CameraPosition = { 0.0f, 0.0f, 3.0f };
-			m_CameraYaw = 0.0f;
-			m_CameraPitch = 0.0f;
-			m_VerticalFov = 45.0f;
+			camera = ComputeRenderer::Camera{};
 			cameraChanged = true;
 		}
 
@@ -145,7 +148,7 @@ public:
 		ImGui::TextWrapped("WASD: Move | Mouse: Look | Esc: Release");
 
 		if (cameraChanged)
-			UpdateCamera();
+			m_Renderer.SetCamera(camera);
 
 		ImGui::End();
 
@@ -431,26 +434,6 @@ public:
 	}
 
 private:
-	glm::vec3 CalculateCameraForward() const
-	{
-		const float yaw = glm::radians(m_CameraYaw);
-		const float pitch = glm::radians(m_CameraPitch);
-
-		glm::vec3 forward;
-		forward.x = glm::cos(pitch) * glm::sin(yaw);
-		forward.y = glm::sin(pitch);
-		forward.z = -glm::cos(pitch) * glm::cos(yaw);
-		return glm::normalize(forward);
-	}
-
-	void UpdateCamera()
-	{
-		m_Renderer.SetCamera(
-			m_CameraPosition,
-			CalculateCameraForward(),
-			m_VerticalFov);
-	}
-
 	void SetMouseLookEnabled(bool enabled)
 	{
 		if (m_MouseLookEnabled == enabled)
@@ -466,10 +449,6 @@ private:
 
 private:
 	ComputeRenderer m_Renderer;
-	glm::vec3 m_CameraPosition = { 0.0f, 0.0f, 3.0f };
-	float m_CameraYaw = 0.0f;
-	float m_CameraPitch = 0.0f;
-	float m_VerticalFov = 45.0f;
 	float m_Exposure = 1.0f;
 	float m_CameraMoveSpeed = 3.0f;
 	float m_MouseSensitivity = 0.1f;

@@ -111,6 +111,19 @@ namespace
 		return result;
 	}
 
+	// The limits match the UI sliders, so a camera that came out of a scene file
+	// is always a camera the controls can still represent. Clamping the pitch
+	// away from straight up also keeps the forward vector from lining up with the
+	// world up vector, which would collapse the camera basis.
+	ComputeRenderer::Camera SanitizeCamera(
+		const ComputeRenderer::Camera& camera)
+	{
+		ComputeRenderer::Camera result = camera;
+		result.Pitch = std::clamp(result.Pitch, -89.0f, 89.0f);
+		result.VerticalFov = std::clamp(result.VerticalFov, 20.0f, 90.0f);
+		return result;
+	}
+
 	bool IsFinite(const ComputeRenderer::Sphere& sphere)
 	{
 		return
@@ -137,6 +150,17 @@ namespace
 			std::isfinite(light.Size.x) &&
 			std::isfinite(light.Size.y) &&
 			std::isfinite(light.Intensity);
+	}
+
+	bool IsFinite(const ComputeRenderer::Camera& camera)
+	{
+		return
+			std::isfinite(camera.Position.x) &&
+			std::isfinite(camera.Position.y) &&
+			std::isfinite(camera.Position.z) &&
+			std::isfinite(camera.Yaw) &&
+			std::isfinite(camera.Pitch) &&
+			std::isfinite(camera.VerticalFov);
 	}
 
 	constexpr float TimingSmoothingFactor = 0.05f;
@@ -178,6 +202,10 @@ void ComputeRenderer::Init(const std::string& shaderPath, uint32_t width, uint32
 	m_Width = width;
 	m_Height = height;
 	m_FrameIndex = 0;
+
+	// Keeps the cached forward vector consistent with the default angles instead
+	// of relying on the two initializers agreeing with each other.
+	UpdateCameraBasis();
 
 	CreateOutputImages();
 	CreateSceneBuffer();
@@ -584,7 +612,7 @@ bool ComputeRenderer::SaveScene(
 	}
 
 	file << std::setprecision(std::numeric_limits<float>::max_digits10);
-	file << "WALNUT_RAY_SCENE 2\n";
+	file << "WALNUT_RAY_SCENE 3\n";
 	file << "SPHERE_COUNT " << m_Spheres.size() << '\n';
 	for (const Sphere& sphere : m_Spheres)
 	{
@@ -613,6 +641,15 @@ bool ComputeRenderer::SaveScene(
 			<< light.Size.y << ' '
 			<< light.Intensity << '\n';
 	}
+	// Appended after the lights the same way the light block was appended after
+	// the spheres, so each version only adds to the end of the previous format.
+	file << "CAMERA "
+		<< m_Camera.Position.x << ' '
+		<< m_Camera.Position.y << ' '
+		<< m_Camera.Position.z << ' '
+		<< m_Camera.Yaw << ' '
+		<< m_Camera.Pitch << ' '
+		<< m_Camera.VerticalFov << '\n';
 	file.flush();
 
 	if (!file)
@@ -640,7 +677,7 @@ bool ComputeRenderer::LoadScene(
 	uint32_t version = 0;
 	if (!(file >> label >> version) ||
 		label != "WALNUT_RAY_SCENE" ||
-		(version != 1 && version != 2))
+		version < 1 || version > 3)
 	{
 		errorMessage = "Scene header or version is invalid.";
 		return false;
@@ -731,6 +768,30 @@ bool ComputeRenderer::LoadScene(
 		loadedLights.push_back(SanitizeAreaLight(loadedLight));
 	}
 
+	// Versions 1 and 2 carry no camera, so those files keep whatever view the
+	// user is looking from instead of snapping back to the default one.
+	Camera loadedCamera = m_Camera;
+	if (version >= 3)
+	{
+		if (!(file >> label) || label != "CAMERA" ||
+			!(file
+				>> loadedCamera.Position.x
+				>> loadedCamera.Position.y
+				>> loadedCamera.Position.z
+				>> loadedCamera.Yaw
+				>> loadedCamera.Pitch
+				>> loadedCamera.VerticalFov))
+		{
+			errorMessage = "Camera data is missing or invalid.";
+			return false;
+		}
+		if (!IsFinite(loadedCamera))
+		{
+			errorMessage = "Camera data contains a non-finite number.";
+			return false;
+		}
+	}
+
 	std::string unexpectedData;
 	if (file >> unexpectedData)
 	{
@@ -740,6 +801,8 @@ bool ComputeRenderer::LoadScene(
 
 	m_Spheres = std::move(loadedSpheres);
 	m_Lights = std::move(loadedLights);
+	m_Camera = SanitizeCamera(loadedCamera);
+	UpdateCameraBasis();
 	UploadSceneBuffer();
 	UploadLightBuffer();
 	ResetAccumulation();
@@ -803,15 +866,27 @@ uint32_t ComputeRenderer::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFl
 	throw std::runtime_error("A suitable Vulkan memory type could not be found.");
 }
 
-void ComputeRenderer::SetCamera(
-	const glm::vec3& position,
-	const glm::vec3& forward,
-	float verticalFov)
+void ComputeRenderer::SetCamera(const Camera& camera)
 {
-	m_CameraPosition = position;
-	m_CameraForward = glm::normalize(forward);
-	m_VerticalFov = verticalFov;
+	m_Camera = SanitizeCamera(camera);
+	UpdateCameraBasis();
 	ResetAccumulation();
+}
+
+// Turns the two angles the UI edits into the forward vector the shader needs.
+// Yaw turns the camera around the world up axis and pitch tilts it, so this is a
+// spherical to Cartesian conversion. Zero yaw and zero pitch has to come out as
+// -Z because that is the direction the camera looks in by default.
+void ComputeRenderer::UpdateCameraBasis()
+{
+	const float yaw = glm::radians(m_Camera.Yaw);
+	const float pitch = glm::radians(m_Camera.Pitch);
+
+	glm::vec3 forward;
+	forward.x = glm::cos(pitch) * glm::sin(yaw);
+	forward.y = glm::sin(pitch);
+	forward.z = -glm::cos(pitch) * glm::cos(yaw);
+	m_CameraForward = glm::normalize(forward);
 }
 
 void ComputeRenderer::ResetAccumulation()
@@ -1171,10 +1246,10 @@ void ComputeRenderer::Render()
 
 	m_FrameIndex++;
 	PushConstants pushConstants{};
-	pushConstants.CameraPosition = glm::vec4(m_CameraPosition, 1.0f);
+	pushConstants.CameraPosition = glm::vec4(m_Camera.Position, 1.0f);
 	pushConstants.CameraForward = glm::vec4(m_CameraForward, 0.0f);
 	pushConstants.FrameIndex = m_FrameIndex;
-	pushConstants.VerticalFov = m_VerticalFov;
+	pushConstants.VerticalFov = m_Camera.VerticalFov;
 	pushConstants.Exposure = m_Exposure;
 	pushConstants.SphereCount = GetSphereCount();
 	// A node count of zero would leave the shader without a root to start from,

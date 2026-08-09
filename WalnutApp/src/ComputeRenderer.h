@@ -27,6 +27,17 @@ public:
 		float Intensity;
 	};
 
+	// Yaw and pitch are stored in degrees instead of a forward vector because
+	// they are what the UI edits and what a scene file can round trip; the
+	// renderer derives the forward vector from them.
+	struct Camera
+	{
+		glm::vec3 Position = { 0.0f, 0.0f, 3.0f };
+		float Yaw = 0.0f;
+		float Pitch = 0.0f;
+		float VerticalFov = 45.0f;
+	};
+
 	static constexpr uint32_t MaxSphereCount = 512;
 
 	// A binary tree over N primitives needs at most 2N-1 nodes, so this capacity
@@ -42,10 +53,9 @@ public:
 	void Init(const std::string& shaderPath, uint32_t width, uint32_t height);
 	void Render();
 	void Resize(uint32_t width, uint32_t height);
-	void SetCamera(
-		const glm::vec3& position,
-		const glm::vec3& forward,
-		float verticalFov);
+	const Camera& GetCamera() const { return m_Camera; }
+	void SetCamera(const Camera& camera);
+	const glm::vec3& GetCameraForward() const { return m_CameraForward; }
 	void SetExposure(float exposure) { m_Exposure = exposure; }
 	const Sphere& GetSphere(uint32_t index) const;
 	void SetSphere(uint32_t index, const Sphere& sphere);
@@ -75,6 +85,7 @@ public:
 
 private:
 	uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
+	void UpdateCameraBasis();
 	void CreateImage(
 		VkFormat format,
 		VkImageUsageFlags usage,
@@ -110,9 +121,10 @@ private:
 	uint32_t m_Width = 0;
 	uint32_t m_Height = 0;
 	uint32_t m_FrameIndex = 0;
-	glm::vec3 m_CameraPosition = { 0.0f, 0.0f, 3.0f };
+	Camera m_Camera;
+	// Derived from the camera yaw and pitch, cached so the basis is only
+	// recomputed when the camera actually changes.
 	glm::vec3 m_CameraForward = { 0.0f, 0.0f, -1.0f };
-	float m_VerticalFov = 45.0f;
 	float m_Exposure = 1.0f;
 	std::vector<Sphere> m_Spheres;
 	std::vector<AreaLight> m_Lights;
