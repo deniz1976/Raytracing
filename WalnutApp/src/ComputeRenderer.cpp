@@ -19,7 +19,8 @@
 namespace
 {
 	// SceneSettings.x is 1 when the BVH should be traversed, .y is the number of
-	// lights in the light buffer. The remaining two slots are reserved padding.
+	// lights in the light buffer, .z is 1 when each hit samples a single random
+	// light instead of all of them. The last slot is reserved padding.
 	struct alignas(16) PushConstants
 	{
 		glm::vec4 CameraPosition;
@@ -1255,8 +1256,11 @@ void ComputeRenderer::Render()
 	// A node count of zero would leave the shader without a root to start from,
 	// so the brute force loop stays as the fallback.
 	const bool traverseBvh = m_UseBvh && m_BvhNodeCount > 0;
-	pushConstants.SceneSettings =
-		glm::uvec4(traverseBvh ? 1u : 0u, GetLightCount(), 0, 0);
+	pushConstants.SceneSettings = glm::uvec4(
+		traverseBvh ? 1u : 0u,
+		GetLightCount(),
+		m_UseStochasticLights ? 1u : 0u,
+		0);
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 

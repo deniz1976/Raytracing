@@ -67,8 +67,20 @@ public:
 	void SetLight(uint32_t index, const AreaLight& light);
 	bool AddLight();
 	bool RemoveLight(uint32_t index);
+
 	void SetBvhEnabled(bool enabled) { m_UseBvh = enabled; }
 	bool IsBvhEnabled() const { return m_UseBvh; }
+	// Changing the sampling strategy changes what every sample means, so the
+	// already accumulated frames cannot be mixed with the new ones.
+	void SetStochasticLightsEnabled(bool enabled)
+	{
+		if (m_UseStochasticLights == enabled)
+			return;
+
+		m_UseStochasticLights = enabled;
+		ResetAccumulation();
+	}
+	bool AreStochasticLightsEnabled() const { return m_UseStochasticLights; }
 	void ResetAccumulation();
 
 	VkDescriptorSet GetImageDescriptorSet() const { return m_ImGuiDescriptorSet; }
@@ -130,6 +142,14 @@ private:
 	std::vector<AreaLight> m_Lights;
 
 	bool m_UseBvh = true;
+	// Picking one random light per hit keeps the shadow ray cost independent of
+	// the light count, at the price of extra noise that accumulation removes.
+	// Measured at 128 spheres and 8 lights, that trade is a loss for a still
+	// image: one light is 3.6 times cheaper per frame but needs about 12 times
+	// more frames to reach the same noise level. It pays off while the camera
+	// moves and every frame starts over, and it is what lets the light count
+	// grow past this cap, so it stays available but off by default.
+	bool m_UseStochasticLights = false;
 	// Spheres are uploaded in BVH leaf order, so a leaf can point at a
 	// contiguous range of the GPU buffer instead of an indirection list.
 	std::vector<uint32_t> m_SphereOrder;

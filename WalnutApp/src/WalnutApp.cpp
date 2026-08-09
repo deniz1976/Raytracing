@@ -415,6 +415,17 @@ public:
 			m_Renderer.GetBvhNodeCount(),
 			m_Renderer.GetBvhDepth());
 
+		bool stochasticLights = m_Renderer.AreStochasticLightsEnabled();
+		// Unlike the BVH toggle this one changes what a single sample is worth,
+		// so the renderer restarts the accumulation instead of keeping it.
+		if (ImGui::Checkbox("Sample one light per hit", &stochasticLights))
+			m_Renderer.SetStochasticLightsEnabled(stochasticLights);
+		ImGui::Text(
+			"Shadow rays per hit: %u",
+			stochasticLights
+				? (m_Renderer.GetLightCount() > 0 ? 1u : 0u)
+				: m_Renderer.GetLightCount());
+
 		ImGui::Separator();
 		ImGui::Text(
 			"Resolution: %u x %u",
@@ -430,7 +441,12 @@ public:
 			"one queue and the swapchain is vsync limited, that wait absorbs "
 			"the wait for the display, so CPU render time stays near the frame "
 			"time even when the dispatch is much shorter. Turn the BVH off to "
-			"compare the tree against testing every sphere.");
+			"compare the tree against testing every sphere. Sampling one light "
+			"per hit keeps the shadow ray cost flat as lights are added and "
+			"converges to the same image, but each sample is noisier, so more "
+			"frames are needed. At eight lights the extra frames cost more than "
+			"the cheaper dispatch saves; it helps while the camera moves and "
+			"pays off once a scene carries many more lights.");
 		ImGui::End();
 	}
 

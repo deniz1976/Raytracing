@@ -410,6 +410,52 @@ vec3 CalculateAreaLight(
 		attenuation;
 }
 
+// Spends one shadow ray on a random point of one light and returns the direct
+// contribution of that light alone. Both the all-lights loop and the stochastic
+// single-light path call this, so they differ only in how many times it runs and
+// how the result is weighted.
+vec3 SampleAreaLight(
+	uint lightIndex,
+	HitRecord hit,
+	inout uint randomState)
+{
+	AreaLight light = GetAreaLight(lightIndex);
+
+	vec2 lightOffset =
+		(vec2(
+			NextRandom(randomState),
+			NextRandom(randomState)) - 0.5) *
+		light.Size;
+	vec3 sampledLightPosition =
+		light.Position +
+		vec3(lightOffset.x, 0.0, lightOffset.y);
+
+	vec3 surfaceToLight = sampledLightPosition - hit.Position;
+	float lightDistance = length(surfaceToLight);
+
+	// A light sampled exactly on the surface would divide by zero and poison the
+	// running sum with a NaN.
+	if (lightDistance < RAY_EPSILON)
+		return vec3(0.0);
+
+	vec3 directionToLight = surfaceToLight / lightDistance;
+
+	bool isInShadow = IsOccluded(
+		hit.Position,
+		hit.Normal,
+		directionToLight,
+		lightDistance);
+
+	float lightVisibility = isInShadow ? 0.0 : 1.0;
+	return CalculateAreaLight(
+		light,
+		hit.SurfaceMaterial,
+		hit.Normal,
+		directionToLight,
+		lightDistance,
+		lightVisibility);
+}
+
 vec3 GetSkyColor(vec3 rayDirection)
 {
 	float skyBlend = 0.5 * (rayDirection.y + 1.0);
@@ -437,6 +483,7 @@ vec3 TraceRay(
 	vec3 throughput = vec3(1.0);
 	uint randomState = randomSeed;
 	uint lightCount = u_PushConstants.SceneSettings.y;
+	bool sampleOneLight = u_PushConstants.SceneSettings.z != 0u;
 
 	for (int bounceIndex = 0; bounceIndex < MAX_BOUNCES; bounceIndex++)
 	{
@@ -450,48 +497,33 @@ vec3 TraceRay(
 
 		vec3 surfaceColor = CalculateAmbientLight(closestHit.SurfaceMaterial);
 
-		// Every light is sampled independently and its contribution is summed,
-		// which is why light count multiplies the shadow ray cost per bounce.
-		for (uint lightIndex = 0; lightIndex < lightCount; lightIndex++)
+		if (sampleOneLight && lightCount > 0u)
 		{
-			AreaLight light = GetAreaLight(lightIndex);
+			// One uniformly chosen light stands in for the whole list, so the
+			// shadow ray cost per bounce no longer grows with light count. The
+			// estimator is contribution / pdf, and a uniform choice among N
+			// lights has pdf = 1/N, so the single sample is scaled by N. That
+			// keeps the expected value equal to the full sum while trading exact
+			// shading for extra variance, which accumulation averages away.
+			uint lightIndex = min(
+				uint(NextRandom(randomState) * float(lightCount)),
+				lightCount - 1u);
 
-			vec2 lightOffset =
-				(vec2(
-					NextRandom(randomState),
-					NextRandom(randomState)) - 0.5) *
-				light.Size;
-			vec3 sampledLightPosition =
-				light.Position +
-				vec3(lightOffset.x, 0.0, lightOffset.y);
-
-			vec3 surfaceToLight =
-				sampledLightPosition -
-				closestHit.Position;
-			float lightDistance = length(surfaceToLight);
-
-			// A light sampled exactly on the surface would divide by zero and
-			// poison the running sum with a NaN.
-			if (lightDistance < RAY_EPSILON)
-				continue;
-
-			vec3 directionToLight =
-				surfaceToLight / lightDistance;
-
-			bool isInShadow = IsOccluded(
-				closestHit.Position,
-				closestHit.Normal,
-				directionToLight,
-				lightDistance);
-
-			float lightVisibility = isInShadow ? 0.0 : 1.0;
-			surfaceColor += CalculateAreaLight(
-				light,
-				closestHit.SurfaceMaterial,
-				closestHit.Normal,
-				directionToLight,
-				lightDistance,
-				lightVisibility);
+			surfaceColor +=
+				SampleAreaLight(lightIndex, closestHit, randomState) *
+				float(lightCount);
+		}
+		else
+		{
+			// Every light is sampled independently and its contribution is
+			// summed, so light count multiplies the shadow ray cost per bounce.
+			for (uint lightIndex = 0; lightIndex < lightCount; lightIndex++)
+			{
+				surfaceColor += SampleAreaLight(
+					lightIndex,
+					closestHit,
+					randomState);
+			}
 		}
 
 		float reflectivity = closestHit.SurfaceMaterial.Reflectivity;
