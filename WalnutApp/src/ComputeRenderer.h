@@ -48,6 +48,12 @@ public:
 	// smaller than the sphere capacity.
 	static constexpr uint32_t MaxLightCount = 8;
 
+	// The UI slider and the clamp a scene file goes through read the same two
+	// numbers, so an exposure that came out of a file is always one the control
+	// can still represent.
+	static constexpr float MinExposure = 0.1f;
+	static constexpr float MaxExposure = 4.0f;
+
 	~ComputeRenderer();
 
 	void Init(const std::string& shaderPath, uint32_t width, uint32_t height);
@@ -56,7 +62,8 @@ public:
 	const Camera& GetCamera() const { return m_Camera; }
 	void SetCamera(const Camera& camera);
 	const glm::vec3& GetCameraForward() const { return m_CameraForward; }
-	void SetExposure(float exposure) { m_Exposure = exposure; }
+	float GetExposure() const { return m_Exposure; }
+	void SetExposure(float exposure);
 	const Sphere& GetSphere(uint32_t index) const;
 	void SetSphere(uint32_t index, const Sphere& sphere);
 	bool AddSphere();
@@ -137,6 +144,8 @@ private:
 	// Derived from the camera yaw and pitch, cached so the basis is only
 	// recomputed when the camera actually changes.
 	glm::vec3 m_CameraForward = { 0.0f, 0.0f, -1.0f };
+	// Owned here rather than in the UI for the same reason the camera is: a scene
+	// load changes it, and a second copy in the UI would go stale.
 	float m_Exposure = 1.0f;
 	std::vector<Sphere> m_Spheres;
 	std::vector<AreaLight> m_Lights;

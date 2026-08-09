@@ -118,13 +118,16 @@ public:
 			20.0f,
 			90.0f);
 
+		// Read back from the renderer for the same reason the camera is, so a
+		// loaded scene moves this slider without any extra bookkeeping.
+		float exposure = m_Renderer.GetExposure();
 		if (ImGui::SliderFloat(
 			"Exposure",
-			&m_Exposure,
-			0.1f,
-			4.0f))
+			&exposure,
+			ComputeRenderer::MinExposure,
+			ComputeRenderer::MaxExposure))
 		{
-			m_Renderer.SetExposure(m_Exposure);
+			m_Renderer.SetExposure(exposure);
 		}
 
 		if (ImGui::Button("Reset Camera"))
@@ -470,7 +473,6 @@ private:
 
 private:
 	ComputeRenderer m_Renderer;
-	float m_Exposure = 1.0f;
 	float m_CameraMoveSpeed = 3.0f;
 	float m_MouseSensitivity = 0.1f;
 	glm::vec2 m_LastMousePosition = { 0.0f, 0.0f };

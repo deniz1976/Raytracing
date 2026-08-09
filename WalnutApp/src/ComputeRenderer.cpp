@@ -125,6 +125,14 @@ namespace
 		return result;
 	}
 
+	float SanitizeExposure(float exposure)
+	{
+		return std::clamp(
+			exposure,
+			ComputeRenderer::MinExposure,
+			ComputeRenderer::MaxExposure);
+	}
+
 	bool IsFinite(const ComputeRenderer::Sphere& sphere)
 	{
 		return
@@ -654,7 +662,7 @@ bool ComputeRenderer::SaveScene(
 	}
 
 	file << std::setprecision(std::numeric_limits<float>::max_digits10);
-	file << "WALNUT_RAY_SCENE 3\n";
+	file << "WALNUT_RAY_SCENE 4\n";
 	file << "SPHERE_COUNT " << m_Spheres.size() << '\n';
 	for (const Sphere& sphere : m_Spheres)
 	{
@@ -692,6 +700,9 @@ bool ComputeRenderer::SaveScene(
 		<< m_Camera.Yaw << ' '
 		<< m_Camera.Pitch << ' '
 		<< m_Camera.VerticalFov << '\n';
+	// Exposure belongs in the file for the same reason the camera does: it is part
+	// of the picture the user set up, not of the machine they set it up on.
+	file << "EXPOSURE " << m_Exposure << '\n';
 	file.flush();
 
 	if (!file)
@@ -719,7 +730,7 @@ bool ComputeRenderer::LoadScene(
 	uint32_t version = 0;
 	if (!(file >> label >> version) ||
 		label != "WALNUT_RAY_SCENE" ||
-		version < 1 || version > 3)
+		version < 1 || version > 4)
 	{
 		errorMessage = "Scene header or version is invalid.";
 		return false;
@@ -834,6 +845,23 @@ bool ComputeRenderer::LoadScene(
 		}
 	}
 
+	// Versions before 4 carry no exposure, so those files keep whatever the user
+	// has dialled in, the same way older files keep the current camera.
+	float loadedExposure = m_Exposure;
+	if (version >= 4)
+	{
+		if (!(file >> label >> loadedExposure) || label != "EXPOSURE")
+		{
+			errorMessage = "Exposure is missing or invalid.";
+			return false;
+		}
+		if (!std::isfinite(loadedExposure))
+		{
+			errorMessage = "Exposure is not a finite number.";
+			return false;
+		}
+	}
+
 	std::string unexpectedData;
 	if (file >> unexpectedData)
 	{
@@ -844,6 +872,7 @@ bool ComputeRenderer::LoadScene(
 	m_Spheres = std::move(loadedSpheres);
 	m_Lights = std::move(loadedLights);
 	m_Camera = SanitizeCamera(loadedCamera);
+	m_Exposure = SanitizeExposure(loadedExposure);
 	UpdateCameraBasis();
 	UploadSceneBuffer();
 	UploadLightBuffer();
@@ -913,6 +942,14 @@ void ComputeRenderer::SetCamera(const Camera& camera)
 	m_Camera = SanitizeCamera(camera);
 	UpdateCameraBasis();
 	ResetAccumulation();
+}
+
+// Exposure only scales the averaged colour on its way to the screen, so unlike a
+// camera or scene change it leaves the meaning of the accumulated samples intact
+// and must not reset them.
+void ComputeRenderer::SetExposure(float exposure)
+{
+	m_Exposure = SanitizeExposure(exposure);
 }
 
 // Turns the two angles the UI edits into the forward vector the shader needs.
