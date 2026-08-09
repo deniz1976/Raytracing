@@ -142,13 +142,19 @@ private:
 	std::vector<AreaLight> m_Lights;
 
 	bool m_UseBvh = true;
-	// Picking one random light per hit keeps the shadow ray cost independent of
-	// the light count, at the price of extra noise that accumulation removes.
-	// Measured at 128 spheres and 8 lights, that trade is a loss for a still
-	// image: one light is 3.6 times cheaper per frame but needs about 12 times
-	// more frames to reach the same noise level. It pays off while the camera
-	// moves and every frame starts over, and it is what lets the light count
-	// grow past this cap, so it stays available but off by default.
+	// Sampling one light per hit keeps the shadow ray cost independent of the
+	// light count, at the price of extra noise that accumulation removes. The
+	// light is chosen in proportion to its weight, which cut the noise by up to
+	// 5.97 times against choosing uniformly and never did worse: with equal
+	// weights the two agree exactly, because equal weights make equal slices.
+	//
+	// Whether one light beats summing all of them still depends on the scene. At
+	// 8 lights, correcting for the noise the reference itself carries, one light
+	// needs 1.9 times more frames when a single light dominates a hundred to one
+	// but 48 times more when all eight are equal, against roughly 3 times cheaper
+	// frames either way. So it wins clearly on the lopsided scene and loses on the
+	// even one, which is why it stays available but off by default. It is also
+	// what lets the light count grow past this cap at a fixed cost per frame.
 	bool m_UseStochasticLights = false;
 	// Spheres are uploaded in BVH leaf order, so a leaf can point at a
 	// contiguous range of the GPU buffer instead of an indirection list.

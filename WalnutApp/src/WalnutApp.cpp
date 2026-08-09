@@ -444,9 +444,13 @@ public:
 			"compare the tree against testing every sphere. Sampling one light "
 			"per hit keeps the shadow ray cost flat as lights are added and "
 			"converges to the same image, but each sample is noisier, so more "
-			"frames are needed. At eight lights the extra frames cost more than "
-			"the cheaper dispatch saves; it helps while the camera moves and "
-			"pays off once a scene carries many more lights.");
+			"frames are needed. The light is picked in proportion to its "
+			"brightness and colour, so uneven scenes lose far less to that noise "
+			"than even ones: with one light dominating it needs about twice the "
+			"frames for the same result while each frame is three times cheaper, "
+			"but with eight equal lights it needs about fifty times the frames. "
+			"It also helps while the camera moves, and it is what keeps the cost "
+			"flat as a scene gains many more lights.");
 		ImGui::End();
 	}
 

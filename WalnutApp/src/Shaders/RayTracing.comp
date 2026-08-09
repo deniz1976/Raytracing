@@ -410,6 +410,47 @@ vec3 CalculateAreaLight(
 		attenuation;
 }
 
+// Picks one light in proportion to the slice of the total weight it was given on
+// the CPU, and reports the probability of that pick so the caller can divide the
+// contribution by it. Returns false only when no light carries any weight, which
+// means every one of them would have contributed exactly zero.
+//
+// The slices are scanned in order rather than binary searched because the light
+// count is capped at eight; the bounds are stored as a running total precisely so
+// that a search can replace this loop once the cap grows.
+bool SelectAreaLight(
+	uint lightCount,
+	inout uint randomState,
+	out uint selectedLight,
+	out float selectionProbability)
+{
+	float random = NextRandom(randomState);
+
+	selectedLight = lightCount;
+	selectionProbability = 0.0;
+
+	for (uint lightIndex = 0u; lightIndex < lightCount; lightIndex++)
+	{
+		float probability = u_LightBuffer.Lights[lightIndex].SizePadding.w;
+
+		// A zero slice belongs to a light that cannot contribute at all, and its
+		// bound repeats the previous one, so skipping it changes no other pick.
+		if (probability <= 0.0)
+			continue;
+
+		// Remembered on every candidate so that a random value of exactly one,
+		// which no bound is strictly greater than, still ends up on a light with a
+		// probability that can be divided by instead of dropping the sample.
+		selectedLight = lightIndex;
+		selectionProbability = probability;
+
+		if (random < u_LightBuffer.Lights[lightIndex].SizePadding.z)
+			return true;
+	}
+
+	return selectedLight < lightCount;
+}
+
 // Spends one shadow ray on a random point of one light and returns the direct
 // contribution of that light alone. Both the all-lights loop and the stochastic
 // single-light path call this, so they differ only in how many times it runs and
@@ -499,19 +540,30 @@ vec3 TraceRay(
 
 		if (sampleOneLight && lightCount > 0u)
 		{
-			// One uniformly chosen light stands in for the whole list, so the
-			// shadow ray cost per bounce no longer grows with light count. The
-			// estimator is contribution / pdf, and a uniform choice among N
-			// lights has pdf = 1/N, so the single sample is scaled by N. That
-			// keeps the expected value equal to the full sum while trading exact
-			// shading for extra variance, which accumulation averages away.
-			uint lightIndex = min(
-				uint(NextRandom(randomState) * float(lightCount)),
-				lightCount - 1u);
-
-			surfaceColor +=
-				SampleAreaLight(lightIndex, closestHit, randomState) *
-				float(lightCount);
+			// One chosen light stands in for the whole list, so the shadow ray
+			// cost per bounce no longer grows with light count. The estimator is
+			// contribution / probability, which keeps the expected value equal to
+			// the full sum whatever the probabilities are, as long as the divisor
+			// is the probability actually used to pick. Trading exact shading for
+			// variance is what accumulation then averages away.
+			//
+			// The probabilities follow the light weights rather than being equal,
+			// so the lights that can contribute most are the ones usually picked.
+			// A bright light picked often is divided by a large probability and a
+			// dim one picked rarely by a small one, so the average is unchanged
+			// while the samples land closer to it.
+			uint lightIndex;
+			float selectionProbability;
+			if (SelectAreaLight(
+				lightCount,
+				randomState,
+				lightIndex,
+				selectionProbability))
+			{
+				surfaceColor +=
+					SampleAreaLight(lightIndex, closestHit, randomState) /
+					selectionProbability;
+			}
 		}
 		else
 		{

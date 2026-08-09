@@ -19,8 +19,8 @@
 namespace
 {
 	// SceneSettings.x is 1 when the BVH should be traversed, .y is the number of
-	// lights in the light buffer, .z is 1 when each hit samples a single random
-	// light instead of all of them. The last slot is reserved padding.
+	// lights in the light buffer, .z is 1 when each hit samples a single light
+	// chosen by weight instead of all of them. The last slot is reserved padding.
 	struct alignas(16) PushConstants
 	{
 		glm::vec4 CameraPosition;
@@ -541,6 +541,47 @@ void ComputeRenderer::UploadLightBuffer()
 		gpuLights[lightIndex].Color = glm::vec4(light.Color, 0.0f);
 		gpuLights[lightIndex].SizePadding =
 			glm::vec4(light.Size, 0.0f, 0.0f);
+	}
+
+	// The stochastic path picks one light per hit, and how often it picks each
+	// one decides how noisy that single sample is. Choosing in proportion to how
+	// much a light can contribute keeps the estimator unbiased while making the
+	// large contributors the ones that actually get sampled.
+	float totalWeight = 0.0f;
+	std::array<float, MaxLightCount> weights{};
+	for (size_t lightIndex = 0; lightIndex < m_Lights.size(); lightIndex++)
+	{
+		const AreaLight& light = m_Lights[lightIndex];
+		// Everything the shader multiplies into the result that the CPU can know
+		// ahead of time. Distance, incidence angle and visibility are properties
+		// of the shading point, so they cannot appear here; this is a bound on
+		// the light rather than its actual contribution.
+		weights[lightIndex] =
+			light.Intensity *
+			(light.Color.r + light.Color.g + light.Color.b);
+		totalWeight += weights[lightIndex];
+	}
+
+	// A zero weight means zero intensity or a black colour, and either one makes
+	// the shader's contribution exactly zero. Such a light gets a zero width
+	// slice below, so it is never picked; dropping a term that is always zero
+	// costs no accuracy. When every light is like that the whole sum is zero and
+	// the slices stay empty, which the shader treats as nothing to sample.
+	if (totalWeight > 0.0f)
+	{
+		float cumulativeWeight = 0.0f;
+		for (size_t lightIndex = 0; lightIndex < m_Lights.size(); lightIndex++)
+		{
+			cumulativeWeight += weights[lightIndex];
+			gpuLights[lightIndex].SizePadding.z =
+				cumulativeWeight / totalWeight;
+			gpuLights[lightIndex].SizePadding.w =
+				weights[lightIndex] / totalWeight;
+		}
+
+		// Rounding can leave the last bound a hair below one, which would let a
+		// random number land past every slice. Pinning it closes that gap.
+		gpuLights[m_Lights.size() - 1].SizePadding.z = 1.0f;
 	}
 
 	WriteHostBuffer(m_LightBufferMemory, gpuLights.data(), sizeof(gpuLights));
