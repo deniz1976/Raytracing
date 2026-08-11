@@ -106,6 +106,7 @@ public:
 	bool SaveScene(const std::string& path, std::string& errorMessage) const;
 	bool LoadScene(const std::string& path, std::string& errorMessage);
 	bool LoadObj(const std::string& path, std::string& errorMessage);
+	const std::string& GetModelPath() const { return m_ModelPath; }
 	const ModelTransform& GetModelTransform() const { return m_ModelTransform; }
 	void SetModelTransform(const ModelTransform& transform);
 	const SphereLight& GetLight(uint32_t index) const;
@@ -230,6 +231,7 @@ private:
 	std::vector<Sphere> m_Spheres;
 	std::vector<Triangle> m_Triangles;
 	std::vector<Triangle> m_ModelTriangles;
+	std::string m_ModelPath;
 	ModelTransform m_ModelTransform;
 	std::vector<uint32_t> m_TriangleOrder;
 	uint32_t m_TriangleBvhNodeCount = 0;

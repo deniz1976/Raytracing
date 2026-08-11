@@ -1310,6 +1310,7 @@ bool ComputeRenderer::LoadObj(
 	// Commit only after the whole file passes validation. A malformed model
 	// therefore cannot erase the triangles that are currently being displayed.
 	m_ModelTriangles = std::move(loadedTriangles);
+	m_ModelPath = path;
 	ApplyModelTransform();
 	return true;
 }
@@ -1408,7 +1409,7 @@ bool ComputeRenderer::SaveScene(
 	}
 
 	file << std::setprecision(std::numeric_limits<float>::max_digits10);
-	file << "WALNUT_RAY_SCENE 7\n";
+	file << "WALNUT_RAY_SCENE 8\n";
 	file << "SPHERE_COUNT " << m_Spheres.size() << '\n';
 	for (const Sphere& sphere : m_Spheres)
 	{
@@ -1469,6 +1470,19 @@ bool ComputeRenderer::SaveScene(
 	file << "LIGHT_RADIUS_COUNT " << m_Lights.size() << '\n';
 	for (const SphereLight& light : m_Lights)
 		file << "LIGHT_RADIUS " << light.Radius << '\n';
+	// Version 8 stores the external model reference and its world placement.
+	// std::quoted preserves spaces without inventing a separate escaping format.
+	file << "MODEL_PATH " << std::quoted(m_ModelPath) << '\n';
+	file << "MODEL_TRANSFORM "
+		<< m_ModelTransform.Position.x << ' '
+		<< m_ModelTransform.Position.y << ' '
+		<< m_ModelTransform.Position.z << ' '
+		<< m_ModelTransform.Rotation.x << ' '
+		<< m_ModelTransform.Rotation.y << ' '
+		<< m_ModelTransform.Rotation.z << ' '
+		<< m_ModelTransform.Scale.x << ' '
+		<< m_ModelTransform.Scale.y << ' '
+		<< m_ModelTransform.Scale.z << '\n';
 	file.flush();
 
 	if (!file)
@@ -1496,7 +1510,7 @@ bool ComputeRenderer::LoadScene(
 	uint32_t version = 0;
 	if (!(file >> label >> version) ||
 		label != "WALNUT_RAY_SCENE" ||
-		version < 1 || version > 7)
+		version < 1 || version > 8)
 	{
 		errorMessage = "Scene header or version is invalid.";
 		return false;
@@ -1721,11 +1735,65 @@ bool ComputeRenderer::LoadScene(
 		}
 	}
 
+	std::string loadedModelPath = m_ModelPath;
+	ModelTransform loadedModelTransform = m_ModelTransform;
+	if (version >= 8)
+	{
+		if (!(file >> label >> std::quoted(loadedModelPath)) ||
+			label != "MODEL_PATH" || loadedModelPath.empty())
+		{
+			errorMessage = "Model path is missing or invalid.";
+			return false;
+		}
+		if (!(file >> label) || label != "MODEL_TRANSFORM" ||
+			!(file
+				>> loadedModelTransform.Position.x
+				>> loadedModelTransform.Position.y
+				>> loadedModelTransform.Position.z
+				>> loadedModelTransform.Rotation.x
+				>> loadedModelTransform.Rotation.y
+				>> loadedModelTransform.Rotation.z
+				>> loadedModelTransform.Scale.x
+				>> loadedModelTransform.Scale.y
+				>> loadedModelTransform.Scale.z))
+		{
+			errorMessage = "Model transform is missing or invalid.";
+			return false;
+		}
+
+		const glm::vec3 transformValues[] = {
+			loadedModelTransform.Position,
+			loadedModelTransform.Rotation,
+			loadedModelTransform.Scale
+		};
+		for (const glm::vec3& value : transformValues)
+		{
+			if (!std::isfinite(value.x) ||
+				!std::isfinite(value.y) ||
+				!std::isfinite(value.z))
+			{
+				errorMessage = "Model transform contains a non-finite number.";
+				return false;
+			}
+		}
+	}
+
 	std::string unexpectedData;
 	if (file >> unexpectedData)
 	{
 		errorMessage = "Scene file contains unexpected trailing data.";
 		return false;
+	}
+
+	if (version >= 8)
+	{
+		std::string modelError;
+		if (!LoadObj(loadedModelPath, modelError))
+		{
+			errorMessage = "Scene model could not be loaded: " + modelError;
+			return false;
+		}
+		SetModelTransform(loadedModelTransform);
 	}
 
 	m_Spheres = std::move(loadedSpheres);

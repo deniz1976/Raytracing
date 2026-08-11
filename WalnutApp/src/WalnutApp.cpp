@@ -6,6 +6,7 @@
 
 #include <glm/gtc/constants.hpp>
 
+#include <algorithm>
 #include <array>
 #include <string>
 
@@ -207,6 +208,12 @@ public:
 			if (m_Renderer.LoadScene(SceneFilePath, errorMessage))
 			{
 				m_SceneStatus = "Scene loaded.";
+				m_ObjPath.fill('\0');
+				const std::string& loadedModelPath = m_Renderer.GetModelPath();
+				std::copy_n(
+					loadedModelPath.data(),
+					std::min(loadedModelPath.size(), m_ObjPath.size() - 1),
+					m_ObjPath.data());
 				const uint32_t loadedSphereCount = m_Renderer.GetSphereCount();
 				if (loadedSphereCount == 0)
 					m_SelectedSphereIndex = 0;
