@@ -487,11 +487,13 @@ bool TraceSphereLights(
 	Ray ray,
 	uint lightCount,
 	float maximumDistance,
-	out vec3 emission)
+	out vec3 emission,
+	out uint hitLightIndex)
 {
 	float closestDistance = maximumDistance;
 	bool hitAnything = false;
 	emission = vec3(0.0);
+	hitLightIndex = lightCount;
 
 	for (uint lightIndex = 0u; lightIndex < lightCount; lightIndex++)
 	{
@@ -505,6 +507,7 @@ bool TraceSphereLights(
 		{
 			closestDistance = hitDistance;
 			emission = light.Color * light.Intensity;
+			hitLightIndex = lightIndex;
 			hitAnything = true;
 		}
 	}
@@ -512,26 +515,52 @@ bool TraceSphereLights(
 	return hitAnything;
 }
 
+float PowerHeuristic(float firstPdf, float secondPdf)
+{
+	float firstSquared = firstPdf * firstPdf;
+	float secondSquared = secondPdf * secondPdf;
+	float denominator = firstSquared + secondSquared;
+	return denominator > 0.0 ? firstSquared / denominator : 0.0;
+}
+
+float SphereLightDirectionPdf(vec3 surfacePosition, SphereLight light)
+{
+	vec3 surfaceToCenter = light.Position - surfacePosition;
+	float centerDistanceSquared = dot(surfaceToCenter, surfaceToCenter);
+	float radiusSquared = light.Radius * light.Radius;
+	if (centerDistanceSquared <= radiusSquared)
+		return 1.0 / (4.0 * PI);
+
+	float sinThetaMaxSquared = radiusSquared / centerDistanceSquared;
+	float cosThetaMax = sqrt(max(0.0, 1.0 - sinThetaMaxSquared));
+	float solidAngle =
+		2.0 * PI * sinThetaMaxSquared / (1.0 + cosThetaMax);
+	return solidAngle > 0.0 ? 1.0 / solidAngle : 0.0;
+}
+
 vec3 CalculateSphereLight(
 	SphereLight light,
 	Material material,
 	vec3 surfaceNormal,
 	vec3 directionToLight,
-	float lightSamplePdf,
+	float lightTechniquePdf,
+	float bsdfPdf,
 	float lightVisibility)
 {
 	float surfaceCosine = max(dot(surfaceNormal, directionToLight), 0.0);
-	if (surfaceCosine <= 0.0 || lightSamplePdf <= 0.0)
+	if (surfaceCosine <= 0.0 || lightTechniquePdf <= 0.0)
 		return vec3(0.0);
 
 	vec3 emittedRadiance = light.Color * light.Intensity;
 	vec3 brdf = EvaluateLambertBrdf(material);
+	float misWeight = PowerHeuristic(lightTechniquePdf, bsdfPdf);
 	return
 		brdf *
 		emittedRadiance *
 		surfaceCosine *
 		lightVisibility /
-		lightSamplePdf;
+		lightTechniquePdf *
+		misWeight;
 }
 
 // Picks one light in proportion to the slice of the total weight it was given on
@@ -582,7 +611,8 @@ bool SelectSphereLight(
 vec3 SampleSphereLight(
 	uint lightIndex,
 	HitRecord hit,
-	inout uint randomState)
+	inout uint randomState,
+	float lightSelectionProbability)
 {
 	SphereLight light = GetSphereLight(lightIndex);
 	vec3 surfaceToCenter = light.Position - hit.Position;
@@ -590,13 +620,13 @@ vec3 SampleSphereLight(
 	float radiusSquared = light.Radius * light.Radius;
 
 	vec3 directionToLight;
-	float lightSamplePdf;
+	float lightDirectionPdf;
 	if (centerDistanceSquared <= radiusSquared)
 	{
 		// An overlapping emitter surrounds the shading point and covers the full
 		// sphere of directions. Treat it as two-sided for this edge case.
 		directionToLight = RandomUnitVector(randomState);
-		lightSamplePdf = 1.0 / (4.0 * PI);
+		lightDirectionPdf = 1.0 / (4.0 * PI);
 	}
 	else
 	{
@@ -622,7 +652,7 @@ vec3 SampleSphereLight(
 		// between two nearly equal floats for a tiny, distant light.
 		float solidAngle =
 			2.0 * PI * sinThetaMaxSquared / (1.0 + cosThetaMax);
-		lightSamplePdf = 1.0 / solidAngle;
+		lightDirectionPdf = 1.0 / solidAngle;
 	}
 
 	Ray lightRay;
@@ -642,12 +672,16 @@ vec3 SampleSphereLight(
 		lightDistance);
 
 	float lightVisibility = isInShadow ? 0.0 : 1.0;
+	float lightTechniquePdf =
+		lightSelectionProbability * lightDirectionPdf;
+	float bsdfPdf = LambertPdf(hit.Normal, directionToLight);
 	return CalculateSphereLight(
 		light,
 		hit.SurfaceMaterial,
 		hit.Normal,
 		directionToLight,
-		lightSamplePdf,
+		lightTechniquePdf,
+		bsdfPdf,
 		lightVisibility);
 }
 
@@ -679,10 +713,9 @@ vec3 TraceRay(
 	uint randomState = randomSeed;
 	uint lightCount = u_PushConstants.SceneSettings.y;
 	bool sampleOneLight = u_PushConstants.SceneSettings.z != 0u;
-	// Primary and specular rays may see an emitter. A diffuse bounce already
-	// estimates direct emitters explicitly, so accepting the same path again
-	// through a lucky BSDF sample would count that lighting twice.
-	bool allowEmitterHit = true;
+	bool previousBounceWasDiffuse = false;
+	vec3 previousSurfacePosition = vec3(0.0);
+	float previousBsdfPdf = 0.0;
 
 	for (
 		uint bounceIndex = 0u;
@@ -711,6 +744,7 @@ vec3 TraceRay(
 		HitRecord closestHit;
 		bool hitSurface = TraceScene(ray, closestHit);
 		vec3 lightEmission;
+		uint hitLightIndex;
 
 		// A directly visible emitter, or one reached by a reflection/refraction,
 		// contributes its own emitted radiance instead of behaving like a material.
@@ -718,10 +752,28 @@ vec3 TraceRay(
 			ray,
 			lightCount,
 			closestHit.Distance,
-			lightEmission))
+			lightEmission,
+			hitLightIndex))
 		{
-			if (allowEmitterHit)
-				accumulatedColor += throughput * lightEmission;
+			float emitterWeight = 1.0;
+			if (previousBounceWasDiffuse)
+			{
+				SphereLight hitLight = GetSphereLight(hitLightIndex);
+				float lightSelectionProbability = sampleOneLight
+					? u_LightBuffer.Lights[hitLightIndex].RadiusSampling.w
+					: 1.0;
+				float lightTechniquePdf =
+					lightSelectionProbability *
+					SphereLightDirectionPdf(
+						previousSurfacePosition,
+						hitLight);
+				emitterWeight = PowerHeuristic(
+					previousBsdfPdf,
+					lightTechniquePdf);
+			}
+
+			accumulatedColor +=
+				throughput * lightEmission * emitterWeight;
 			break;
 		}
 
@@ -752,9 +804,11 @@ vec3 TraceRay(
 					lightIndex,
 					selectionProbability))
 				{
-					surfaceColor +=
-						SampleSphereLight(lightIndex, closestHit, randomState) /
-						selectionProbability;
+					surfaceColor += SampleSphereLight(
+						lightIndex,
+						closestHit,
+						randomState,
+						selectionProbability);
 				}
 			}
 			else
@@ -766,7 +820,8 @@ vec3 TraceRay(
 					surfaceColor += SampleSphereLight(
 						lightIndex,
 						closestHit,
-						randomState);
+						randomState,
+						1.0);
 				}
 			}
 		}
@@ -794,7 +849,9 @@ vec3 TraceRay(
 				EvaluateLambertBrdf(material) *
 				surfaceCosine /
 				directionPdf;
-			allowEmitterHit = false;
+			previousBounceWasDiffuse = true;
+			previousSurfacePosition = closestHit.Position;
+			previousBsdfPdf = directionPdf;
 			continue;
 		}
 
@@ -829,7 +886,7 @@ vec3 TraceRay(
 			// the new direction puts an entering ray inside and an exiting ray outside.
 			throughput *= material.Albedo;
 			ray.Origin = closestHit.Position + ray.Direction * RAY_EPSILON;
-			allowEmitterHit = true;
+			previousBounceWasDiffuse = false;
 			continue;
 		}
 
@@ -866,7 +923,7 @@ vec3 TraceRay(
 			perfectReflection,
 			randomDirection,
 			roughness));
-		allowEmitterHit = true;
+		previousBounceWasDiffuse = false;
 	}
 
 	return accumulatedColor;
