@@ -413,10 +413,23 @@ public:
 		// compared without waiting for the picture to converge again.
 		if (ImGui::Checkbox("Use BVH", &bvhEnabled))
 			m_Renderer.SetBvhEnabled(bvhEnabled);
+
+		bool sahSplitEnabled = m_Renderer.IsSahSplitEnabled();
+		// Same reasoning as the BVH toggle: a different split rearranges the tree
+		// but cannot change which sphere a ray meets first, so the samples stand.
+		if (ImGui::Checkbox("SAH split (off: median split)", &sahSplitEnabled))
+			m_Renderer.SetSahSplitEnabled(sahSplitEnabled);
+
 		ImGui::Text(
 			"BVH nodes: %u (depth %u)",
 			m_Renderer.GetBvhNodeCount(),
 			m_Renderer.GetBvhDepth());
+		ImGui::Text(
+			"Estimated sphere tests per ray: %.2f",
+			m_Renderer.GetBvhCost());
+		ImGui::Text(
+			"BVH build time: %.3f ms",
+			m_Renderer.GetBvhBuildTimeMs());
 
 		bool stochasticLights = m_Renderer.AreStochasticLightsEnabled();
 		// Unlike the BVH toggle this one changes what a single sample is worth,
@@ -443,8 +456,25 @@ public:
 			"submission and the fence wait. Because compute and present share "
 			"one queue and the swapchain is vsync limited, that wait absorbs "
 			"the wait for the display, so CPU render time stays near the frame "
-			"time even when the dispatch is much shorter. Turn the BVH off to "
-			"compare the tree against testing every sphere. Sampling one light "
+			"time even when the dispatch is much shorter.");
+		ImGui::TextWrapped(
+			"Turn the BVH off to compare the tree against testing every sphere. "
+			"The split heuristic decides where each range of spheres is cut in "
+			"two: the surface area heuristic cuts where the two child boxes are "
+			"cheapest to trace, while the median split cuts where the sphere "
+			"count is even. Estimated sphere tests per ray is what the heuristic "
+			"itself predicts for the finished tree, so it compares two trees over "
+			"the same scene immediately, without waiting for a timing average to "
+			"settle. Compare it against the sphere count, which is what testing "
+			"every sphere would cost. The two splits agree on an evenly spread "
+			"scene and part company on a clumped one, because only the heuristic "
+			"can see that a box packed tightly around a cluster is one a ray "
+			"usually misses. Neither changes the image: within a tree, the near "
+			"child is always visited first, so a surface found early shrinks the "
+			"distance the box test prunes against and the far box behind it is "
+			"rejected without ever being opened.");
+		ImGui::TextWrapped(
+			"Sampling one light "
 			"per hit keeps the shadow ray cost flat as lights are added and "
 			"converges to the same image, but each sample is noisier, so more "
 			"frames are needed. The light is picked in proportion to its "

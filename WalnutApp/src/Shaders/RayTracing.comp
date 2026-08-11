@@ -18,8 +18,12 @@ layout(std430, set = 0, binding = 2) readonly buffer SphereBuffer
 } u_SphereBuffer;
 
 // Links.x is the left child of an interior node or the first sphere of a leaf,
-// Links.y is the right child, Links.z is the sphere count. A count of zero marks
-// an interior node.
+// Links.y is the right child, Links.z is the sphere count and Links.w is the axis
+// the range was split along. A count of zero marks an interior node.
+//
+// The build guarantees the left child holds the spheres with the smaller
+// coordinate along that axis, which is what lets the traversal below work out
+// which child is the near one from the sign of the ray direction alone.
 struct BvhNodeData
 {
 	vec4 BoundsMin;
@@ -60,8 +64,9 @@ layout(push_constant) uniform PushConstants
 const int MAX_BOUNCES = 3;
 const float RAY_EPSILON = 0.001;
 
-// A median split tree over the 512 sphere capacity stays about ten levels deep,
-// so this stack has plenty of headroom; pushes are still guarded.
+// A stack entry is only worth pushing if the far child can still turn out to be
+// worth visiting, so both children go on and the near one comes off first. The
+// build bounds the tree depth to well under this, and pushes stay guarded.
 const int BVH_STACK_SIZE = 32;
 
 struct Ray
@@ -289,8 +294,18 @@ bool TraceScene(
 
 		if (stackSize + 2 <= BVH_STACK_SIZE)
 		{
-			nodeStack[stackSize++] = node.Links.y;
-			nodeStack[stackSize++] = node.Links.x;
+			// The left child holds the smaller coordinates along the split axis, so
+			// a ray travelling in the positive direction on that axis reaches it
+			// first. Visiting the near child first is what makes the pruning above
+			// pay off: any surface found in it shrinks closestHit.Distance before
+			// the far box is ever tested, and a far box behind that surface is then
+			// rejected outright. Popping happens in reverse, so the far child is
+			// the one pushed first.
+			int splitAxis = int(node.Links.w);
+			bool leftIsNear = ray.Direction[splitAxis] >= 0.0;
+
+			nodeStack[stackSize++] = leftIsNear ? node.Links.y : node.Links.x;
+			nodeStack[stackSize++] = leftIsNear ? node.Links.x : node.Links.y;
 		}
 	}
 
@@ -360,6 +375,11 @@ bool IsOccluded(
 
 		if (stackSize + 2 <= BVH_STACK_SIZE)
 		{
+			// Deliberately not ordered near to far the way TraceScene is. That
+			// ordering pays off by shrinking the distance the box test prunes
+			// against, and a shadow ray has no such distance: its limit is fixed at
+			// the light and any blocker at all ends the search. So the sort would
+			// cost work per node and buy nothing back.
 			nodeStack[stackSize++] = node.Links.y;
 			nodeStack[stackSize++] = node.Links.x;
 		}

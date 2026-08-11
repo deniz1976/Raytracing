@@ -70,6 +70,90 @@ namespace
 
 	constexpr uint32_t BvhLeafSphereCount = 2;
 
+	// A leaf is allowed to hold more than the minimum when the heuristic says
+	// splitting would not pay for itself, but not without limit: past this many
+	// spheres a leaf costs more than the extra box test, so the split is forced.
+	constexpr uint32_t BvhMaxLeafSphereCount = 4;
+
+	// The shader traverses with a fixed size stack of BVH_STACK_SIZE entries and
+	// silently drops children it cannot push. That stack holds at most one pending
+	// sibling per level, so bounding the depth here is what keeps the traversal
+	// from losing geometry. A median split is balanced and would never come close,
+	// but the surface area heuristic follows the spheres instead of the count and
+	// can build a deep, lopsided branch, so the bound has to be enforced.
+	constexpr uint32_t BvhMaxDepth = 30;
+
+	// Testing every position between two spheres would make the build quadratic.
+	// Sorting the spheres into a fixed number of slices along the axis and only
+	// cutting between slices keeps it linear per axis, and the candidate it finds
+	// is close enough to the best one that the difference does not show.
+	constexpr uint32_t BvhSahBinCount = 12;
+
+	// The cost of descending into one interior node, measured in sphere tests.
+	// It only decides how eagerly the build stops splitting, because it is the one
+	// term that does not shrink when the boxes get tighter.
+	constexpr float BvhTraversalCost = 0.125f;
+
+	// An axis aligned box grown one point or one box at a time. Kept separate from
+	// the node struct because the build needs a running box per bin, which never
+	// reaches the GPU.
+	struct BvhBounds
+	{
+		glm::vec3 Min{ std::numeric_limits<float>::max() };
+		glm::vec3 Max{ std::numeric_limits<float>::lowest() };
+
+		void Grow(const glm::vec3& point)
+		{
+			Min = glm::min(Min, point);
+			Max = glm::max(Max, point);
+		}
+
+		void Grow(const BvhBounds& other)
+		{
+			Min = glm::min(Min, other.Min);
+			Max = glm::max(Max, other.Max);
+		}
+
+		bool IsEmpty() const { return Min.x > Max.x; }
+
+		// The chance that a random ray crossing the parent box also crosses this
+		// one is the ratio of their surface areas, which is why surface area and
+		// not volume is what the split heuristic weighs the sphere counts with.
+		float SurfaceArea() const
+		{
+			if (IsEmpty())
+				return 0.0f;
+
+			const glm::vec3 extent = Max - Min;
+			return 2.0f * (
+				extent.x * extent.y +
+				extent.y * extent.z +
+				extent.z * extent.x);
+		}
+	};
+
+	// One slice of the split axis: how many spheres landed in it and the box that
+	// encloses them.
+	struct BvhSahBin
+	{
+		BvhBounds Bounds;
+		uint32_t Count = 0;
+	};
+
+	// Which slice a centroid falls into. The multiply is hoisted out by the
+	// caller because it is the same for every sphere in the range, and the clamp
+	// catches the centroid sitting exactly on the upper bound.
+	uint32_t SahBinIndex(float centroid, float axisMin, float binScale)
+	{
+		const float slice = (centroid - axisMin) * binScale;
+		if (slice <= 0.0f)
+			return 0;
+
+		return std::min(
+			BvhSahBinCount - 1u,
+			static_cast<uint32_t>(slice));
+	}
+
 	// One pending subtree during the build: the slice of the sphere order array
 	// it owns, the node that describes it and how deep it sits in the tree.
 	struct BvhBuildEntry
@@ -411,13 +495,198 @@ void ComputeRenderer::WriteHostBuffer(
 	vkUnmapMemory(device, memory);
 }
 
+// Searches for the cheapest place to cut one range of spheres in two.
+//
+// The heuristic behind the search: a ray that has already entered this node's box
+// enters a child box with a probability equal to the ratio of their surface areas,
+// and once inside it pays one test per sphere the child holds. So the expected
+// cost of a cut is one descent plus each side's sphere count weighted by its share
+// of the parent area. Cutting where that sum is smallest packs the spheres a ray
+// is likely to miss into a small box it can reject with a single test, which is
+// what an even count split has no way to notice.
+//
+// Instead of trying every gap between two spheres, the range is sorted into a
+// fixed number of slices along the axis and only the cuts between slices are
+// scored. That keeps the search linear in the sphere count per axis while landing
+// close enough to the true optimum that the difference does not show.
+//
+// The spheres with the smaller coordinate always end up first, because the shader
+// relies on the left child being the near side when the ray travels along +axis.
+ComputeRenderer::SahSplitResult ComputeRenderer::FindSahSplit(
+	uint32_t start,
+	uint32_t count,
+	float parentSurfaceArea,
+	uint32_t& splitAxis,
+	uint32_t& leftCount)
+{
+	if (parentSurfaceArea <= 0.0f)
+		return SahSplitResult::NoCandidate;
+
+	BvhBounds centroidBounds;
+	for (uint32_t offset = 0; offset < count; offset++)
+		centroidBounds.Grow(m_Spheres[m_SphereOrder[start + offset]].Center);
+
+	const glm::vec3 centroidExtent = centroidBounds.Max - centroidBounds.Min;
+
+	float bestCost = std::numeric_limits<float>::max();
+	uint32_t bestAxis = 3;
+	uint32_t bestCut = 0;
+
+	for (uint32_t axis = 0; axis < 3; axis++)
+	{
+		// Every centroid shares this coordinate, so no cut along it separates
+		// anything and the bin scale would divide by zero.
+		if (centroidExtent[axis] <= 0.0f)
+			continue;
+
+		const float axisMin = centroidBounds.Min[axis];
+		const float binScale =
+			static_cast<float>(BvhSahBinCount) / centroidExtent[axis];
+
+		std::array<BvhSahBin, BvhSahBinCount> bins{};
+		for (uint32_t offset = 0; offset < count; offset++)
+		{
+			const Sphere& sphere = m_Spheres[m_SphereOrder[start + offset]];
+			BvhSahBin& bin = bins[SahBinIndex(
+				sphere.Center[axis],
+				axisMin,
+				binScale)];
+			bin.Count++;
+			bin.Bounds.Grow(sphere.Center - glm::vec3(sphere.Radius));
+			bin.Bounds.Grow(sphere.Center + glm::vec3(sphere.Radius));
+		}
+
+		// One sweep from the left records, for every cut, the box and the count of
+		// everything before it. Without it each cut would rescan the bins and the
+		// search would be quadratic in the bin count for no reason.
+		std::array<float, BvhSahBinCount - 1> leftAreas{};
+		std::array<uint32_t, BvhSahBinCount - 1> leftCounts{};
+		BvhBounds leftBounds;
+		uint32_t leftSoFar = 0;
+		for (uint32_t binIndex = 0; binIndex + 1 < BvhSahBinCount; binIndex++)
+		{
+			leftBounds.Grow(bins[binIndex].Bounds);
+			leftSoFar += bins[binIndex].Count;
+			leftAreas[binIndex] = leftBounds.SurfaceArea();
+			leftCounts[binIndex] = leftSoFar;
+		}
+
+		// The right side is swept backwards for the same reason, which is also why
+		// the two sweeps have to run in opposite directions.
+		BvhBounds rightBounds;
+		uint32_t rightSoFar = 0;
+		for (uint32_t binIndex = BvhSahBinCount - 1; binIndex > 0; binIndex--)
+		{
+			rightBounds.Grow(bins[binIndex].Bounds);
+			rightSoFar += bins[binIndex].Count;
+
+			const uint32_t cut = binIndex - 1;
+			// An empty side is not a split at all, and scoring it would let a cut
+			// that changes nothing look free.
+			if (leftCounts[cut] == 0 || rightSoFar == 0)
+				continue;
+
+			const float cost =
+				BvhTraversalCost +
+				(leftAreas[cut] * static_cast<float>(leftCounts[cut]) +
+					rightBounds.SurfaceArea() * static_cast<float>(rightSoFar)) /
+					parentSurfaceArea;
+
+			if (cost < bestCost)
+			{
+				bestCost = cost;
+				bestAxis = axis;
+				bestCut = cut;
+			}
+		}
+	}
+
+	if (bestAxis > 2)
+		return SahSplitResult::NoCandidate;
+
+	// Keeping the range whole costs one sphere test per sphere. A split only earns
+	// its extra node and extra box test when it beats that. Past the leaf limit it
+	// is taken anyway, because every ray that enters a long leaf pays for all of
+	// it, and because a bounded leaf keeps the tree from degenerating.
+	if (bestCost >= static_cast<float>(count) && count <= BvhMaxLeafSphereCount)
+		return SahSplitResult::Leaf;
+
+	const float axisMin = centroidBounds.Min[bestAxis];
+	const float binScale =
+		static_cast<float>(BvhSahBinCount) / centroidExtent[bestAxis];
+	const auto rangeBegin = m_SphereOrder.begin() + start;
+	const auto rangeEnd = rangeBegin + count;
+	const auto splitPoint = std::partition(
+		rangeBegin,
+		rangeEnd,
+		[this, bestAxis, bestCut, axisMin, binScale](uint32_t sphereIndex)
+		{
+			return SahBinIndex(
+				m_Spheres[sphereIndex].Center[bestAxis],
+				axisMin,
+				binScale) <= bestCut;
+		});
+
+	leftCount = static_cast<uint32_t>(splitPoint - rangeBegin);
+
+	// The bin counts already proved both sides hold something, and the partition
+	// asks the same question of the same numbers, so this only guards against the
+	// two disagreeing and building a child that owns no spheres.
+	if (leftCount == 0 || leftCount >= count)
+		return SahSplitResult::NoCandidate;
+
+	splitAxis = bestAxis;
+	return SahSplitResult::Split;
+}
+
+// Orders the range by centroid along its widest axis and cuts the count in half.
+// Splitting by index rather than by a spatial plane always succeeds and always
+// stays balanced, which is exactly what is needed when the heuristic finds no
+// plane at all because every centroid coincides.
+void ComputeRenderer::MedianSplit(
+	uint32_t start,
+	uint32_t count,
+	const glm::vec3& centroidExtent,
+	uint32_t& splitAxis,
+	uint32_t& leftCount)
+{
+	uint32_t widestAxis = 0;
+	if (centroidExtent.y > centroidExtent[widestAxis])
+		widestAxis = 1;
+	if (centroidExtent.z > centroidExtent[widestAxis])
+		widestAxis = 2;
+
+	const auto rangeBegin = m_SphereOrder.begin() + start;
+	const auto rangeMiddle = rangeBegin + count / 2;
+	const auto rangeEnd = rangeBegin + count;
+	std::nth_element(
+		rangeBegin,
+		rangeMiddle,
+		rangeEnd,
+		[this, widestAxis](uint32_t leftIndex, uint32_t rightIndex)
+		{
+			return
+				m_Spheres[leftIndex].Center[widestAxis] <
+				m_Spheres[rightIndex].Center[widestAxis];
+		});
+
+	splitAxis = widestAxis;
+	leftCount = count / 2;
+}
+
 // Groups the spheres into a binary tree of axis aligned bounding boxes so a ray
 // can reject a whole branch with one box test instead of touching every sphere.
-// The split is a median split: the range is ordered by centroid along its widest
-// axis and cut in half. Splitting by index rather than by a spatial plane keeps
-// the tree balanced even when many centroids coincide.
+// Where each range is cut is chosen by the surface area heuristic, with the older
+// median split kept reachable from the UI as the thing it has to beat.
+//
+// Two invariants the shader depends on: the left child always holds the spheres
+// with the smaller coordinate along the node's split axis, and no node is deeper
+// than the traversal stack can follow.
 void ComputeRenderer::BuildBvh()
 {
+	const std::chrono::steady_clock::time_point buildBegin =
+		std::chrono::steady_clock::now();
+
 	const uint32_t sphereCount = GetSphereCount();
 
 	m_SphereOrder.resize(sphereCount);
@@ -426,11 +695,17 @@ void ComputeRenderer::BuildBvh()
 
 	m_BvhNodeCount = 0;
 	m_BvhDepth = 0;
+	m_BvhCost = 0.0f;
 
 	std::array<GpuBvhNode, MaxBvhNodeCount> nodes{};
 
 	if (sphereCount > 0)
 	{
+		// The same sum the split search minimises, accumulated over the finished
+		// tree: what one random ray that enters the root box is expected to cost.
+		float costSum = 0.0f;
+		float rootSurfaceArea = 0.0f;
+
 		std::vector<BvhBuildEntry> pending;
 		pending.push_back({ 0, sphereCount, 0, 1 });
 		m_BvhNodeCount = 1;
@@ -441,66 +716,99 @@ void ComputeRenderer::BuildBvh()
 			pending.pop_back();
 			m_BvhDepth = std::max(m_BvhDepth, entry.Depth);
 
-			glm::vec3 boundsMin(std::numeric_limits<float>::max());
-			glm::vec3 boundsMax(std::numeric_limits<float>::lowest());
-			glm::vec3 centroidMin(std::numeric_limits<float>::max());
-			glm::vec3 centroidMax(std::numeric_limits<float>::lowest());
+			BvhBounds nodeBounds;
+			BvhBounds centroidBounds;
 			for (uint32_t offset = 0; offset < entry.Count; offset++)
 			{
 				const Sphere& sphere =
 					m_Spheres[m_SphereOrder[entry.Start + offset]];
-				boundsMin = glm::min(
-					boundsMin, sphere.Center - glm::vec3(sphere.Radius));
-				boundsMax = glm::max(
-					boundsMax, sphere.Center + glm::vec3(sphere.Radius));
-				centroidMin = glm::min(centroidMin, sphere.Center);
-				centroidMax = glm::max(centroidMax, sphere.Center);
+				nodeBounds.Grow(sphere.Center - glm::vec3(sphere.Radius));
+				nodeBounds.Grow(sphere.Center + glm::vec3(sphere.Radius));
+				centroidBounds.Grow(sphere.Center);
 			}
 
 			GpuBvhNode& node = nodes[entry.NodeIndex];
-			node.BoundsMin = glm::vec4(boundsMin, 0.0f);
-			node.BoundsMax = glm::vec4(boundsMax, 0.0f);
+			node.BoundsMin = glm::vec4(nodeBounds.Min, 0.0f);
+			node.BoundsMax = glm::vec4(nodeBounds.Max, 0.0f);
+
+			const float nodeSurfaceArea = nodeBounds.SurfaceArea();
+			// The root is the first entry pushed and the first one popped, so its
+			// area is known before any child needs to be weighed against it.
+			if (entry.NodeIndex == 0)
+				rootSurfaceArea = nodeSurfaceArea;
 
 			// Every split adds two nodes, so stop early enough that the fixed
-			// capacity can never be exceeded.
+			// capacity can never be exceeded, and never build deeper than the
+			// shader stack can follow.
 			const bool canSplit =
 				entry.Count > BvhLeafSphereCount &&
+				entry.Depth < BvhMaxDepth &&
 				m_BvhNodeCount + 2 <= MaxBvhNodeCount;
-			if (!canSplit)
+
+			uint32_t splitAxis = 0;
+			uint32_t leftCount = 0;
+			bool splitRange = false;
+
+			if (canSplit && m_UseSahSplit)
 			{
-				node.Links = glm::uvec4(entry.Start, 0, entry.Count, 0);
-				continue;
+				const SahSplitResult result = FindSahSplit(
+					entry.Start,
+					entry.Count,
+					nodeSurfaceArea,
+					splitAxis,
+					leftCount);
+
+				splitRange = result == SahSplitResult::Split;
+
+				// No plane separates these centroids, so no split can shrink either
+				// child box and a leaf is the honest answer. It still has to be a
+				// bounded one, so past the leaf limit the median split takes over
+				// purely to keep the range from growing without end.
+				if (result == SahSplitResult::NoCandidate &&
+					entry.Count > BvhMaxLeafSphereCount)
+				{
+					MedianSplit(
+						entry.Start,
+						entry.Count,
+						centroidBounds.Max - centroidBounds.Min,
+						splitAxis,
+						leftCount);
+					splitRange = true;
+				}
+			}
+			else if (canSplit)
+			{
+				MedianSplit(
+					entry.Start,
+					entry.Count,
+					centroidBounds.Max - centroidBounds.Min,
+					splitAxis,
+					leftCount);
+				splitRange = true;
 			}
 
-			const glm::vec3 centroidExtent = centroidMax - centroidMin;
-			uint32_t splitAxis = 0;
-			if (centroidExtent.y > centroidExtent[splitAxis])
-				splitAxis = 1;
-			if (centroidExtent.z > centroidExtent[splitAxis])
-				splitAxis = 2;
-
-			const auto rangeBegin = m_SphereOrder.begin() + entry.Start;
-			const auto rangeMiddle = rangeBegin + entry.Count / 2;
-			const auto rangeEnd = rangeBegin + entry.Count;
-			std::nth_element(
-				rangeBegin,
-				rangeMiddle,
-				rangeEnd,
-				[this, splitAxis](uint32_t leftIndex, uint32_t rightIndex)
-				{
-					return
-						m_Spheres[leftIndex].Center[splitAxis] <
-						m_Spheres[rightIndex].Center[splitAxis];
-				});
+			if (!splitRange)
+			{
+				node.Links = glm::uvec4(entry.Start, 0, entry.Count, 0);
+				costSum +=
+					nodeSurfaceArea * static_cast<float>(entry.Count);
+				continue;
+			}
 
 			const uint32_t leftChildIndex = m_BvhNodeCount;
 			const uint32_t rightChildIndex = m_BvhNodeCount + 1;
 			m_BvhNodeCount += 2;
 
-			// A SphereCount of zero marks an interior node.
-			node.Links = glm::uvec4(leftChildIndex, rightChildIndex, 0, 0);
+			// A SphereCount of zero marks an interior node. The split axis rides in
+			// the slot that used to be padding, so the shader can tell which child
+			// lies on the near side of the ray without loading anything extra.
+			node.Links = glm::uvec4(
+				leftChildIndex,
+				rightChildIndex,
+				0,
+				splitAxis);
+			costSum += nodeSurfaceArea * BvhTraversalCost;
 
-			const uint32_t leftCount = entry.Count / 2;
 			pending.push_back({
 				entry.Start,
 				leftCount,
@@ -512,9 +820,17 @@ void ComputeRenderer::BuildBvh()
 				rightChildIndex,
 				entry.Depth + 1 });
 		}
+
+		m_BvhCost = rootSurfaceArea > 0.0f
+			? costSum / rootSurfaceArea
+			: static_cast<float>(sphereCount);
 	}
 
 	WriteHostBuffer(m_BvhBufferMemory, nodes.data(), sizeof(nodes));
+
+	const std::chrono::duration<float, std::milli> buildDuration =
+		std::chrono::steady_clock::now() - buildBegin;
+	m_BvhBuildTimeMs = buildDuration.count();
 }
 
 void ComputeRenderer::UploadSceneBuffer()
@@ -944,6 +1260,19 @@ void ComputeRenderer::SetCamera(const Camera& camera)
 	ResetAccumulation();
 }
 
+// Which split built the tree changes how the spheres are grouped and therefore
+// the order they are stored in, so both the tree and the sphere buffer have to be
+// rewritten. It cannot change which sphere a ray hits first, so the accumulated
+// samples still mean what they meant and are deliberately kept.
+void ComputeRenderer::SetSahSplitEnabled(bool enabled)
+{
+	if (m_UseSahSplit == enabled)
+		return;
+
+	m_UseSahSplit = enabled;
+	UploadSceneBuffer();
+}
+
 // Exposure only scales the averaged colour on its way to the screen, so unlike a
 // camera or scene change it leaves the meaning of the accumulated samples intact
 // and must not reset them.
@@ -1338,7 +1667,7 @@ void ComputeRenderer::Render()
 		traverseBvh ? 1u : 0u,
 		GetLightCount(),
 		m_UseStochasticLights ? 1u : 0u,
-		0);
+		0u);
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
@@ -1443,6 +1772,7 @@ void ComputeRenderer::Render()
 	m_CpuRenderTimeMs =
 		SmoothTiming(m_CpuRenderTimeMs, cpuRenderDuration.count());
 }
+
 
 void ComputeRenderer::Release()
 {

@@ -77,6 +77,11 @@ public:
 
 	void SetBvhEnabled(bool enabled) { m_UseBvh = enabled; }
 	bool IsBvhEnabled() const { return m_UseBvh; }
+	// Which split the tree is built with changes how many boxes and spheres a ray
+	// has to test, never which sphere ends up nearest, so it costs a rebuild and
+	// an upload but leaves the accumulated samples meaningful.
+	void SetSahSplitEnabled(bool enabled);
+	bool IsSahSplitEnabled() const { return m_UseSahSplit; }
 	// Changing the sampling strategy changes what every sample means, so the
 	// already accumulated frames cannot be mixed with the new ones.
 	void SetStochasticLightsEnabled(bool enabled)
@@ -98,6 +103,11 @@ public:
 	uint32_t GetLightCount() const { return static_cast<uint32_t>(m_Lights.size()); }
 	uint32_t GetBvhNodeCount() const { return m_BvhNodeCount; }
 	uint32_t GetBvhDepth() const { return m_BvhDepth; }
+	// The expected number of sphere tests one random ray costs, under the same
+	// heuristic the split search minimises. It compares two trees over the same
+	// scene without waiting for a timing average to settle.
+	float GetBvhCost() const { return m_BvhCost; }
+	float GetBvhBuildTimeMs() const { return m_BvhBuildTimeMs; }
 	float GetCpuRenderTimeMs() const { return m_CpuRenderTimeMs; }
 	float GetGpuComputeTimeMs() const { return m_GpuComputeTimeMs; }
 	bool AreGpuTimestampsSupported() const { return m_TimestampQueryPool != VK_NULL_HANDLE; }
@@ -127,6 +137,29 @@ private:
 		VkDeviceSize size) const;
 	void UploadSceneBuffer();
 	void UploadLightBuffer();
+
+	// What the surface area heuristic concluded about one range of spheres.
+	// NoCandidate is not a failure: it means every centroid fell on the same
+	// plane, so no cut can separate them and the median split has to take over.
+	enum class SahSplitResult
+	{
+		Split,
+		Leaf,
+		NoCandidate
+	};
+
+	SahSplitResult FindSahSplit(
+		uint32_t start,
+		uint32_t count,
+		float parentSurfaceArea,
+		uint32_t& splitAxis,
+		uint32_t& leftCount);
+	void MedianSplit(
+		uint32_t start,
+		uint32_t count,
+		const glm::vec3& centroidExtent,
+		uint32_t& splitAxis,
+		uint32_t& leftCount);
 	void BuildBvh();
 	void CreateComputeDescriptors();
 	void CreateComputePipeline(const std::string& shaderPath);
@@ -165,11 +198,19 @@ private:
 	// even one, which is why it stays available but off by default. It is also
 	// what lets the light count grow past this cap at a fixed cost per frame.
 	bool m_UseStochasticLights = false;
+	// The surface area heuristic splits where the two child boxes are cheapest to
+	// trace rather than where the sphere count is even, so it follows how the
+	// spheres are actually spread out instead of assuming they are uniform. The
+	// median split stays reachable from the UI because it is the thing the
+	// heuristic has to beat, and on an evenly spread scene the two nearly tie.
+	bool m_UseSahSplit = true;
 	// Spheres are uploaded in BVH leaf order, so a leaf can point at a
 	// contiguous range of the GPU buffer instead of an indirection list.
 	std::vector<uint32_t> m_SphereOrder;
 	uint32_t m_BvhNodeCount = 0;
 	uint32_t m_BvhDepth = 0;
+	float m_BvhCost = 0.0f;
+	float m_BvhBuildTimeMs = 0.0f;
 
 	VkBuffer m_SphereBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_SphereBufferMemory = VK_NULL_HANDLE;
