@@ -60,14 +60,15 @@ namespace
 
 	// The same three-vec4 packing the spheres use. Position and intensity share
 	// one vec4 because std430 would pad a lone vec3 out to 16 bytes anyway.
-	struct alignas(16) GpuAreaLight
+	struct alignas(16) GpuSphereLight
 	{
 		glm::vec4 PositionIntensity;
 		glm::vec4 Color;
-		glm::vec4 SizePadding;
+		// x stores radius, z the selection CDF and w its probability.
+		glm::vec4 RadiusSampling;
 	};
 
-	static_assert(sizeof(GpuAreaLight) == 48);
+	static_assert(sizeof(GpuSphereLight) == 48);
 
 	constexpr uint32_t BvhLeafSphereCount = 2;
 
@@ -191,18 +192,15 @@ namespace
 		return result;
 	}
 
-	ComputeRenderer::AreaLight SanitizeAreaLight(
-		const ComputeRenderer::AreaLight& light)
+	ComputeRenderer::SphereLight SanitizeSphereLight(
+		const ComputeRenderer::SphereLight& light)
 	{
-		ComputeRenderer::AreaLight result = light;
+		ComputeRenderer::SphereLight result = light;
 		result.Color = glm::clamp(
 			result.Color,
 			glm::vec3(0.0f),
 			glm::vec3(1.0f));
-		result.Size = glm::clamp(
-			result.Size,
-			glm::vec2(0.05f),
-			glm::vec2(20.0f));
+		result.Radius = std::clamp(result.Radius, 0.05f, 20.0f);
 		result.Intensity = std::clamp(result.Intensity, 0.0f, 100.0f);
 		return result;
 	}
@@ -243,7 +241,7 @@ namespace
 			std::isfinite(sphere.IndexOfRefraction);
 	}
 
-	bool IsFinite(const ComputeRenderer::AreaLight& light)
+	bool IsFinite(const ComputeRenderer::SphereLight& light)
 	{
 		return
 			std::isfinite(light.Position.x) &&
@@ -252,8 +250,7 @@ namespace
 			std::isfinite(light.Color.r) &&
 			std::isfinite(light.Color.g) &&
 			std::isfinite(light.Color.b) &&
-			std::isfinite(light.Size.x) &&
-			std::isfinite(light.Size.y) &&
+			std::isfinite(light.Radius) &&
 			std::isfinite(light.Intensity);
 	}
 
@@ -454,19 +451,19 @@ void ComputeRenderer::CreateLightBuffer()
 	// A warm key light on one side and a dimmer cool fill on the other, so the
 	// scene shows two distinct shadow directions out of the box.
 	m_Lights = {
-		AreaLight{
+		SphereLight{
 			{ -2.5f, 5.0f, 2.0f },
 			{ 1.0f, 0.95f, 0.85f },
-			{ 3.0f, 3.0f },
+			1.5f,
 			24.0f },
-		AreaLight{
+		SphereLight{
 			{ 3.5f, 4.0f, -2.0f },
 			{ 0.45f, 0.6f, 1.0f },
-			{ 2.0f, 2.0f },
+			1.0f,
 			12.0f }
 	};
 
-	const VkDeviceSize bufferSize = sizeof(GpuAreaLight) * MaxLightCount;
+	const VkDeviceSize bufferSize = sizeof(GpuSphereLight) * MaxLightCount;
 	CreateHostBuffer(bufferSize, m_LightBuffer, m_LightBufferMemory);
 	UploadLightBuffer();
 }
@@ -880,15 +877,15 @@ void ComputeRenderer::UploadSceneBuffer()
 
 void ComputeRenderer::UploadLightBuffer()
 {
-	std::array<GpuAreaLight, MaxLightCount> gpuLights{};
+	std::array<GpuSphereLight, MaxLightCount> gpuLights{};
 	for (size_t lightIndex = 0; lightIndex < m_Lights.size(); lightIndex++)
 	{
-		const AreaLight& light = m_Lights[lightIndex];
+		const SphereLight& light = m_Lights[lightIndex];
 		gpuLights[lightIndex].PositionIntensity =
 			glm::vec4(light.Position, light.Intensity);
 		gpuLights[lightIndex].Color = glm::vec4(light.Color, 0.0f);
-		gpuLights[lightIndex].SizePadding =
-			glm::vec4(light.Size, 0.0f, 0.0f);
+		gpuLights[lightIndex].RadiusSampling =
+			glm::vec4(light.Radius, 0.0f, 0.0f, 0.0f);
 	}
 
 	// The stochastic path picks one light per hit, and how often it picks each
@@ -899,7 +896,7 @@ void ComputeRenderer::UploadLightBuffer()
 	std::array<float, MaxLightCount> weights{};
 	for (size_t lightIndex = 0; lightIndex < m_Lights.size(); lightIndex++)
 	{
-		const AreaLight& light = m_Lights[lightIndex];
+		const SphereLight& light = m_Lights[lightIndex];
 		// Everything the shader multiplies into the result that the CPU can know
 		// ahead of time. Distance, incidence angle and visibility are properties
 		// of the shading point, so they cannot appear here; this is a bound on
@@ -921,15 +918,15 @@ void ComputeRenderer::UploadLightBuffer()
 		for (size_t lightIndex = 0; lightIndex < m_Lights.size(); lightIndex++)
 		{
 			cumulativeWeight += weights[lightIndex];
-			gpuLights[lightIndex].SizePadding.z =
+			gpuLights[lightIndex].RadiusSampling.z =
 				cumulativeWeight / totalWeight;
-			gpuLights[lightIndex].SizePadding.w =
+			gpuLights[lightIndex].RadiusSampling.w =
 				weights[lightIndex] / totalWeight;
 		}
 
 		// Rounding can leave the last bound a hair below one, which would let a
 		// random number land past every slice. Pinning it closes that gap.
-		gpuLights[m_Lights.size() - 1].SizePadding.z = 1.0f;
+		gpuLights[m_Lights.size() - 1].RadiusSampling.z = 1.0f;
 	}
 
 	WriteHostBuffer(m_LightBufferMemory, gpuLights.data(), sizeof(gpuLights));
@@ -1004,7 +1001,7 @@ bool ComputeRenderer::SaveScene(
 	}
 
 	file << std::setprecision(std::numeric_limits<float>::max_digits10);
-	file << "WALNUT_RAY_SCENE 6\n";
+	file << "WALNUT_RAY_SCENE 7\n";
 	file << "SPHERE_COUNT " << m_Spheres.size() << '\n';
 	for (const Sphere& sphere : m_Spheres)
 	{
@@ -1020,7 +1017,7 @@ bool ComputeRenderer::SaveScene(
 			<< sphere.Roughness << '\n';
 	}
 	file << "LIGHT_COUNT " << m_Lights.size() << '\n';
-	for (const AreaLight& light : m_Lights)
+	for (const SphereLight& light : m_Lights)
 	{
 		file << "LIGHT "
 			<< light.Position.x << ' '
@@ -1029,8 +1026,8 @@ bool ComputeRenderer::SaveScene(
 			<< light.Color.r << ' '
 			<< light.Color.g << ' '
 			<< light.Color.b << ' '
-			<< light.Size.x << ' '
-			<< light.Size.y << ' '
+			<< light.Radius * 2.0f << ' '
+			<< light.Radius * 2.0f << ' '
 			<< light.Intensity << '\n';
 	}
 	// Appended after the lights the same way the light block was appended after
@@ -1060,6 +1057,11 @@ bool ComputeRenderer::SaveScene(
 	file << "IOR_COUNT " << m_Spheres.size() << '\n';
 	for (const Sphere& sphere : m_Spheres)
 		file << "IOR " << sphere.IndexOfRefraction << '\n';
+	// Version 7 appends the exact spherical light radii. The two legacy size
+	// fields above remain in place so every older block keeps its layout.
+	file << "LIGHT_RADIUS_COUNT " << m_Lights.size() << '\n';
+	for (const SphereLight& light : m_Lights)
+		file << "LIGHT_RADIUS " << light.Radius << '\n';
 	file.flush();
 
 	if (!file)
@@ -1087,7 +1089,7 @@ bool ComputeRenderer::LoadScene(
 	uint32_t version = 0;
 	if (!(file >> label >> version) ||
 		label != "WALNUT_RAY_SCENE" ||
-		version < 1 || version > 6)
+		version < 1 || version > 7)
 	{
 		errorMessage = "Scene header or version is invalid.";
 		return false;
@@ -1150,11 +1152,12 @@ bool ComputeRenderer::LoadScene(
 		}
 	}
 
-	std::vector<AreaLight> loadedLights;
+	std::vector<SphereLight> loadedLights;
 	loadedLights.reserve(static_cast<size_t>(lightCount));
 	for (uint64_t lightIndex = 0; lightIndex < lightCount; lightIndex++)
 	{
-		AreaLight loadedLight{};
+		SphereLight loadedLight{};
+		glm::vec2 legacySize{};
 		if (!(file >> label) || label != "LIGHT" ||
 			!(file
 				>> loadedLight.Position.x
@@ -1163,19 +1166,20 @@ bool ComputeRenderer::LoadScene(
 				>> loadedLight.Color.r
 				>> loadedLight.Color.g
 				>> loadedLight.Color.b
-				>> loadedLight.Size.x
-				>> loadedLight.Size.y
+				>> legacySize.x
+				>> legacySize.y
 				>> loadedLight.Intensity))
 		{
-			errorMessage = "Area light data is missing or invalid.";
+			errorMessage = "Light data is missing or invalid.";
 			return false;
 		}
+		loadedLight.Radius = 0.25f * (legacySize.x + legacySize.y);
 		if (!IsFinite(loadedLight))
 		{
-			errorMessage = "Area light data contains a non-finite number.";
+			errorMessage = "Light data contains a non-finite number.";
 			return false;
 		}
-		loadedLights.push_back(SanitizeAreaLight(loadedLight));
+		loadedLights.push_back(SanitizeSphereLight(loadedLight));
 	}
 
 	// Versions 1 and 2 carry no camera, so those files keep whatever view the
@@ -1278,6 +1282,38 @@ bool ComputeRenderer::LoadScene(
 		}
 	}
 
+	// Version 7 replaces the invisible rectangular emitters with visible sphere
+	// lights. Older versions use half the average legacy side length as a stable
+	// approximation, while new files restore their exact radius here.
+	if (version >= 7)
+	{
+		uint64_t radiusCount = 0;
+		if (!(file >> label >> radiusCount) || label != "LIGHT_RADIUS_COUNT" ||
+			radiusCount != lightCount)
+		{
+			errorMessage = "Light radius count is missing or does not match the lights.";
+			return false;
+		}
+
+		for (uint64_t lightIndex = 0; lightIndex < radiusCount; lightIndex++)
+		{
+			float radius = 0.0f;
+			if (!(file >> label >> radius) || label != "LIGHT_RADIUS")
+			{
+				errorMessage = "Light radius is missing or invalid.";
+				return false;
+			}
+			if (!std::isfinite(radius))
+			{
+				errorMessage = "Light radius is not a finite number.";
+				return false;
+			}
+
+			loadedLights[static_cast<size_t>(lightIndex)].Radius =
+				std::clamp(radius, 0.05f, 20.0f);
+		}
+	}
+
 	std::string unexpectedData;
 	if (file >> unexpectedData)
 	{
@@ -1298,14 +1334,14 @@ bool ComputeRenderer::LoadScene(
 
 
 
-const ComputeRenderer::AreaLight& ComputeRenderer::GetLight(uint32_t index) const
+const ComputeRenderer::SphereLight& ComputeRenderer::GetLight(uint32_t index) const
 {
 	return m_Lights.at(index);
 }
 
-void ComputeRenderer::SetLight(uint32_t index, const AreaLight& light)
+void ComputeRenderer::SetLight(uint32_t index, const SphereLight& light)
 {
-	m_Lights.at(index) = SanitizeAreaLight(light);
+	m_Lights.at(index) = SanitizeSphereLight(light);
 	UploadLightBuffer();
 	ResetAccumulation();
 }
@@ -1318,7 +1354,7 @@ bool ComputeRenderer::AddLight()
 	m_Lights.push_back({
 		{ 0.0f, 5.0f, 0.0f },
 		{ 1.0f, 1.0f, 1.0f },
-		{ 2.0f, 2.0f },
+		1.0f,
 		15.0f
 	});
 	UploadLightBuffer();

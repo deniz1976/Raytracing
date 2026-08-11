@@ -39,16 +39,17 @@ layout(std430, set = 0, binding = 3) readonly buffer BvhBuffer
 
 // Position and intensity share a vec4 because std430 pads a lone vec3 out to 16
 // bytes anyway, so the packing costs nothing and keeps the stride at 48 bytes.
-struct AreaLightData
+struct SphereLightData
 {
 	vec4 PositionIntensity;
 	vec4 Color;
-	vec4 SizePadding;
+	// x is radius, z is the selection CDF and w is its probability.
+	vec4 RadiusSampling;
 };
 
 layout(std430, set = 0, binding = 4) readonly buffer LightBuffer
 {
-	AreaLightData Lights[];
+	SphereLightData Lights[];
 } u_LightBuffer;
 
 layout(push_constant) uniform PushConstants
@@ -89,11 +90,11 @@ struct Material
 	float IndexOfRefraction;
 };
 
-struct AreaLight
+struct SphereLight
 {
 	vec3 Position;
 	vec3 Color;
-	vec2 Size;
+	float Radius;
 	float Intensity;
 };
 
@@ -162,10 +163,8 @@ Material GetSphereMaterial(SphereData sphere)
 	return material;
 }
 
-float HitSphere(Ray ray, SphereData sphere)
+float HitSphereGeometry(Ray ray, vec3 sphereCenter, float sphereRadius)
 {
-	vec3 sphereCenter = sphere.CenterRadius.xyz;
-	float sphereRadius = sphere.CenterRadius.w;
 	vec3 originToCenter = ray.Origin - sphereCenter;
 
 	float a = dot(ray.Direction, ray.Direction);
@@ -188,6 +187,14 @@ float HitSphere(Ray ray, SphereData sphere)
 		return farthestDistance;
 
 	return -1.0;
+}
+
+float HitSphere(Ray ray, SphereData sphere)
+{
+	return HitSphereGeometry(
+		ray,
+		sphere.CenterRadius.xyz,
+		sphere.CenterRadius.w);
 }
 
 // A zero direction component would turn into an infinite reciprocal, and the
@@ -414,16 +421,48 @@ bool IsOccluded(
 	return false;
 }
 
-AreaLight GetAreaLight(uint lightIndex)
+SphereLight GetSphereLight(uint lightIndex)
 {
-	AreaLightData data = u_LightBuffer.Lights[lightIndex];
+	SphereLightData data = u_LightBuffer.Lights[lightIndex];
 
-	AreaLight light;
+	SphereLight light;
 	light.Position = data.PositionIntensity.xyz;
 	light.Intensity = data.PositionIntensity.w;
 	light.Color = data.Color.xyz;
-	light.Size = data.SizePadding.xy;
+	light.Radius = data.RadiusSampling.x;
 	return light;
+}
+
+// Light spheres are not part of the material BVH: there are at most eight, so
+// a short linear scan is cheaper and keeps emitters separate from scene objects.
+// maximumDistance makes a normal sphere hide a light that lies behind it.
+bool TraceSphereLights(
+	Ray ray,
+	uint lightCount,
+	float maximumDistance,
+	out vec3 emission)
+{
+	float closestDistance = maximumDistance;
+	bool hitAnything = false;
+	emission = vec3(0.0);
+
+	for (uint lightIndex = 0u; lightIndex < lightCount; lightIndex++)
+	{
+		SphereLight light = GetSphereLight(lightIndex);
+		float hitDistance = HitSphereGeometry(
+			ray,
+			light.Position,
+			light.Radius);
+
+		if (hitDistance > 0.0 && hitDistance < closestDistance)
+		{
+			closestDistance = hitDistance;
+			emission = light.Color * light.Intensity;
+			hitAnything = true;
+		}
+	}
+
+	return hitAnything;
 }
 
 // The ambient term stands in for light that never arrives directly, so it is a
@@ -434,8 +473,8 @@ vec3 CalculateAmbientLight(Material material)
 	return material.Albedo * 0.08;
 }
 
-vec3 CalculateAreaLight(
-	AreaLight light,
+vec3 CalculateSphereLight(
+	SphereLight light,
 	Material material,
 	vec3 surfaceNormal,
 	vec3 directionToLight,
@@ -464,7 +503,7 @@ vec3 CalculateAreaLight(
 // The slices are scanned in order rather than binary searched because the light
 // count is capped at eight; the bounds are stored as a running total precisely so
 // that a search can replace this loop once the cap grows.
-bool SelectAreaLight(
+bool SelectSphereLight(
 	uint lightCount,
 	inout uint randomState,
 	out uint selectedLight,
@@ -477,7 +516,7 @@ bool SelectAreaLight(
 
 	for (uint lightIndex = 0u; lightIndex < lightCount; lightIndex++)
 	{
-		float probability = u_LightBuffer.Lights[lightIndex].SizePadding.w;
+		float probability = u_LightBuffer.Lights[lightIndex].RadiusSampling.w;
 
 		// A zero slice belongs to a light that cannot contribute at all, and its
 		// bound repeats the previous one, so skipping it changes no other pick.
@@ -490,7 +529,7 @@ bool SelectAreaLight(
 		selectedLight = lightIndex;
 		selectionProbability = probability;
 
-		if (random < u_LightBuffer.Lights[lightIndex].SizePadding.z)
+		if (random < u_LightBuffer.Lights[lightIndex].RadiusSampling.z)
 			return true;
 	}
 
@@ -501,21 +540,16 @@ bool SelectAreaLight(
 // contribution of that light alone. Both the all-lights loop and the stochastic
 // single-light path call this, so they differ only in how many times it runs and
 // how the result is weighted.
-vec3 SampleAreaLight(
+vec3 SampleSphereLight(
 	uint lightIndex,
 	HitRecord hit,
 	inout uint randomState)
 {
-	AreaLight light = GetAreaLight(lightIndex);
+	SphereLight light = GetSphereLight(lightIndex);
 
-	vec2 lightOffset =
-		(vec2(
-			NextRandom(randomState),
-			NextRandom(randomState)) - 0.5) *
-		light.Size;
 	vec3 sampledLightPosition =
 		light.Position +
-		vec3(lightOffset.x, 0.0, lightOffset.y);
+		RandomUnitVector(randomState) * light.Radius;
 
 	vec3 surfaceToLight = sampledLightPosition - hit.Position;
 	float lightDistance = length(surfaceToLight);
@@ -534,7 +568,7 @@ vec3 SampleAreaLight(
 		lightDistance);
 
 	float lightVisibility = isInShadow ? 0.0 : 1.0;
-	return CalculateAreaLight(
+	return CalculateSphereLight(
 		light,
 		hit.SurfaceMaterial,
 		hit.Normal,
@@ -575,8 +609,22 @@ vec3 TraceRay(
 	for (int bounceIndex = 0; bounceIndex < MAX_BOUNCES; bounceIndex++)
 	{
 		HitRecord closestHit;
+		bool hitSurface = TraceScene(ray, closestHit);
+		vec3 lightEmission;
 
-		if (!TraceScene(ray, closestHit))
+		// A directly visible emitter, or one reached by a reflection/refraction,
+		// contributes its own emitted radiance instead of behaving like a material.
+		if (TraceSphereLights(
+			ray,
+			lightCount,
+			closestHit.Distance,
+			lightEmission))
+		{
+			accumulatedColor += throughput * lightEmission;
+			break;
+		}
+
+		if (!hitSurface)
 		{
 			accumulatedColor += throughput * GetSkyColor(ray.Direction);
 			break;
@@ -599,14 +647,14 @@ vec3 TraceRay(
 				// probability keeps the expected value equal to the full light sum.
 				uint lightIndex;
 				float selectionProbability;
-				if (SelectAreaLight(
+				if (SelectSphereLight(
 					lightCount,
 					randomState,
 					lightIndex,
 					selectionProbability))
 				{
 					surfaceColor +=
-						SampleAreaLight(lightIndex, closestHit, randomState) /
+						SampleSphereLight(lightIndex, closestHit, randomState) /
 						selectionProbability;
 				}
 			}
@@ -616,7 +664,7 @@ vec3 TraceRay(
 				// summed, so light count multiplies the shadow ray cost per bounce.
 				for (uint lightIndex = 0; lightIndex < lightCount; lightIndex++)
 				{
-					surfaceColor += SampleAreaLight(
+					surfaceColor += SampleSphereLight(
 						lightIndex,
 						closestHit,
 						randomState);

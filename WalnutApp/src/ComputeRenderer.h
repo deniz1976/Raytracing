@@ -29,11 +29,11 @@ public:
 		float IndexOfRefraction = 1.5f;
 	};
 
-	struct AreaLight
+	struct SphereLight
 	{
 		glm::vec3 Position;
 		glm::vec3 Color;
-		glm::vec2 Size;
+		float Radius;
 		float Intensity;
 	};
 
@@ -80,8 +80,8 @@ public:
 	bool RemoveSphere(uint32_t index);
 	bool SaveScene(const std::string& path, std::string& errorMessage) const;
 	bool LoadScene(const std::string& path, std::string& errorMessage);
-	const AreaLight& GetLight(uint32_t index) const;
-	void SetLight(uint32_t index, const AreaLight& light);
+	const SphereLight& GetLight(uint32_t index) const;
+	void SetLight(uint32_t index, const SphereLight& light);
 	bool AddLight();
 	bool RemoveLight(uint32_t index);
 
@@ -191,7 +191,7 @@ private:
 	// load changes it, and a second copy in the UI would go stale.
 	float m_Exposure = 1.0f;
 	std::vector<Sphere> m_Spheres;
-	std::vector<AreaLight> m_Lights;
+	std::vector<SphereLight> m_Lights;
 
 	bool m_UseBvh = true;
 	// Sampling one light per hit keeps the shadow ray cost independent of the

@@ -331,7 +331,10 @@ public:
 
 		ImGui::End();
 
-		ImGui::Begin("Light Controls");
+		ImGui::Begin("Sphere Light Controls");
+		ImGui::TextWrapped(
+			"Each light is a visible glowing sphere. Radius controls its visible "
+			"size and the softness of its shadows; intensity controls brightness.");
 
 		uint32_t lightCount = m_Renderer.GetLightCount();
 		ImGui::Text(
@@ -375,7 +378,7 @@ public:
 				0,
 				static_cast<int>(lightCount) - 1);
 
-			ComputeRenderer::AreaLight light = m_Renderer.GetLight(
+			ComputeRenderer::SphereLight light = m_Renderer.GetLight(
 				static_cast<uint32_t>(m_SelectedLightIndex));
 			bool lightChanged = false;
 			lightChanged |= ImGui::DragFloat3(
@@ -385,9 +388,9 @@ public:
 			lightChanged |= ImGui::ColorEdit3(
 				"Color",
 				&light.Color.x);
-			lightChanged |= ImGui::DragFloat2(
-				"Size",
-				&light.Size.x,
+			lightChanged |= ImGui::DragFloat(
+				"Radius",
+				&light.Radius,
 				0.05f,
 				0.05f,
 				20.0f);
