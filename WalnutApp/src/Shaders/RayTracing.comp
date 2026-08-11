@@ -82,6 +82,10 @@ layout(std430, set = 0, binding = 6) readonly buffer TriangleBvhBuffer
 layout(set = 0, binding = 7) uniform sampler2D u_ModelTexture;
 layout(set = 0, binding = 8) uniform sampler2D u_EnvironmentTexture;
 layout(set = 0, binding = 9) uniform accelerationStructureEXT u_TriangleTlas;
+layout(std430, set = 0, binding = 10) readonly buffer EnvironmentDistributionBuffer
+{
+	vec4 Entries[];
+} u_EnvironmentDistribution;
 
 layout(push_constant) uniform PushConstants
 {
@@ -1234,6 +1238,62 @@ vec3 GetSkyColor(vec3 rayDirection)
 		u_PushConstants.EnvironmentIntensity;
 }
 
+float EnvironmentDirectionPdf(vec3 direction)
+{
+	uint width = u_PushConstants.HardwareSettings.y;
+	uint height = u_PushConstants.HardwareSettings.z;
+	if (width == 0u || height == 0u)
+		return 0.0;
+	float longitude = atan(direction.z, direction.x) + u_PushConstants.EnvironmentRotation;
+	float latitude = asin(clamp(direction.y, -1.0, 1.0));
+	vec2 uv = vec2(fract(longitude / (2.0 * PI) + 0.5),
+		clamp(0.5 - latitude / PI, 0.0, 0.999999));
+	uvec2 texel = uvec2(uv * vec2(width, height));
+	uint index = texel.y * width + texel.x;
+	float mass = u_EnvironmentDistribution.Entries[index].y;
+	float theta = PI * (float(texel.y) + 0.5) / float(height);
+	float solidAngle = (2.0 * PI / float(width)) * (PI / float(height)) *
+		max(sin(theta), 1e-6);
+	return mass / solidAngle;
+}
+
+vec3 SampleEnvironmentLight(HitRecord hit, Material material, inout uint randomState)
+{
+	uint width = u_PushConstants.HardwareSettings.y;
+	uint height = u_PushConstants.HardwareSettings.z;
+	uint count = width * height;
+	if (u_PushConstants.HardwareSettings.w == 0u || count == 0u)
+		return vec3(0.0);
+	float target = NextRandom(randomState);
+	uint lower = 0u;
+	uint upper = count - 1u;
+	while (lower < upper)
+	{
+		uint middle = lower + (upper - lower) / 2u;
+		if (u_EnvironmentDistribution.Entries[middle].x < target)
+			lower = middle + 1u;
+		else
+			upper = middle;
+	}
+	uvec2 texel = uvec2(lower % width, lower / width);
+	vec2 uv = (vec2(texel) + vec2(NextRandom(randomState), NextRandom(randomState))) /
+		vec2(width, height);
+	float longitude = (uv.x - 0.5) * 2.0 * PI - u_PushConstants.EnvironmentRotation;
+	float latitude = (0.5 - uv.y) * PI;
+	float cosLatitude = cos(latitude);
+	vec3 direction = normalize(vec3(cosLatitude * cos(longitude), sin(latitude),
+		cosLatitude * sin(longitude)));
+	float cosine = max(dot(hit.Normal, direction), 0.0);
+	float environmentPdf = EnvironmentDirectionPdf(direction);
+	if (cosine <= 0.0 || environmentPdf <= 0.0 ||
+		IsOccluded(hit.Position, hit.Normal, direction, 1e30))
+		return vec3(0.0);
+	float bsdfPdf = LambertPdf(hit.Normal, direction);
+	float weight = PowerHeuristic(environmentPdf, bsdfPdf);
+	return EvaluateLambertBrdf(material) * GetSkyColor(direction) *
+		cosine * weight / environmentPdf;
+}
+
 vec3 ToneMapAces(vec3 hdrColor)
 {
 	// This compact ACES filmic fit keeps bright HDR highlights from turning into
@@ -1273,6 +1333,7 @@ vec3 TraceRay(
 	uint lightCount = u_PushConstants.SceneSettings.y;
 	bool sampleOneLight = u_PushConstants.SceneSettings.z != 0u;
 	bool previousBounceUsedDirectLighting = false;
+	bool previousBounceSampledEnvironment = false;
 	vec3 previousSurfacePosition = vec3(0.0);
 	float previousBsdfPdf = 0.0;
 
@@ -1338,7 +1399,10 @@ vec3 TraceRay(
 
 		if (!hitSurface)
 		{
-			accumulatedColor += throughput * GetSkyColor(ray.Direction);
+			float environmentWeight = previousBounceSampledEnvironment
+				? PowerHeuristic(previousBsdfPdf, EnvironmentDirectionPdf(ray.Direction))
+				: 1.0;
+			accumulatedColor += throughput * GetSkyColor(ray.Direction) * environmentWeight;
 			break;
 		}
 
@@ -1391,6 +1455,8 @@ vec3 TraceRay(
 
 		if (material.Type == MATERIAL_DIFFUSE)
 		{
+			surfaceColor += SampleEnvironmentLight(
+				closestHit, material, randomState);
 			// Direct light is one part of the answer. The new cosine-weighted ray
 			// carries the other part: light arriving after one or more surface bounces.
 			accumulatedColor += throughput * surfaceColor;
@@ -1413,6 +1479,8 @@ vec3 TraceRay(
 				surfaceCosine /
 				directionPdf;
 			previousBounceUsedDirectLighting = true;
+			previousBounceSampledEnvironment =
+				u_PushConstants.HardwareSettings.w != 0u;
 			previousSurfacePosition = closestHit.Position;
 			previousBsdfPdf = directionPdf;
 			continue;
@@ -1463,6 +1531,7 @@ vec3 TraceRay(
 			// exiting ray outside without assuming which side reflection chose.
 			ray.Origin = closestHit.Position + ray.Direction * RAY_EPSILON;
 			previousBounceUsedDirectLighting = false;
+			previousBounceSampledEnvironment = false;
 			continue;
 		}
 
@@ -1509,6 +1578,7 @@ vec3 TraceRay(
 				surfaceCosine /
 				directionPdf;
 			previousBounceUsedDirectLighting = true;
+			previousBounceSampledEnvironment = false;
 			previousSurfacePosition = closestHit.Position;
 			previousBsdfPdf = directionPdf;
 			continue;
@@ -1535,6 +1605,7 @@ vec3 TraceRay(
 			randomDirection,
 			roughness));
 		previousBounceUsedDirectLighting = false;
+		previousBounceSampledEnvironment = false;
 	}
 
 	return accumulatedColor;

@@ -80,6 +80,11 @@ namespace
 		glm::vec4 TexCoord2;
 	};
 
+	struct alignas(16) GpuEnvironmentSample
+	{
+		glm::vec4 CdfProbability;
+	};
+
 	static_assert(sizeof(GpuTriangle) == 160);
 
 	// One node of the bounding volume hierarchy. An interior node stores the two
@@ -375,6 +380,10 @@ void ComputeRenderer::Init(const std::string& shaderPath, uint32_t width, uint32
 
 	CreateOutputImages();
 	CreateSceneBuffer();
+	CreateHostBuffer(
+		sizeof(GpuEnvironmentSample) * MaxEnvironmentTexelCount,
+		m_EnvironmentDistributionBuffer,
+		m_EnvironmentDistributionMemory);
 	const uint32_t whitePixel = 0xffffffffu;
 	m_TextureImage = std::make_unique<Walnut::Image>(
 		1,
@@ -1943,8 +1952,61 @@ bool ComputeRenderer::LoadEnvironmentMap(
 	}
 
 	auto environmentImage = std::make_unique<Walnut::Image>(path);
+	if (static_cast<uint64_t>(width) * static_cast<uint64_t>(height) >
+		MaxEnvironmentTexelCount)
+	{
+		errorMessage = "Environment image exceeds the importance sampling texel limit.";
+		return false;
+	}
+	int decodedChannels = 0;
+	float* decodedPixels = stbi_loadf(
+		path.c_str(), &width, &height, &decodedChannels, 4);
+	if (!decodedPixels)
+	{
+		errorMessage = "Environment pixels could not be decoded: " + path;
+		return false;
+	}
+	std::vector<GpuEnvironmentSample> distribution(
+		static_cast<size_t>(width) * height);
+	float totalWeight = 0.0f;
+	for (int y = 0; y < height; y++)
+	{
+		const float theta = 3.14159265359f *
+			(static_cast<float>(y) + 0.5f) / static_cast<float>(height);
+		const float solidAngleFactor = std::sin(theta);
+		for (int x = 0; x < width; x++)
+		{
+			const size_t index = static_cast<size_t>(y) * width + x;
+			const float* pixel = decodedPixels + index * 4;
+			const float luminance =
+				0.2126f * pixel[0] + 0.7152f * pixel[1] + 0.0722f * pixel[2];
+			totalWeight += std::max(luminance, 0.0f) * solidAngleFactor;
+			distribution[index].CdfProbability.x = totalWeight;
+		}
+	}
+	stbi_image_free(decodedPixels);
+	if (totalWeight <= 0.0f)
+	{
+		errorMessage = "Environment image contains no positive luminance.";
+		return false;
+	}
+	float previousCdf = 0.0f;
+	for (GpuEnvironmentSample& sample : distribution)
+	{
+		const float normalizedCdf = sample.CdfProbability.x / totalWeight;
+		sample.CdfProbability.y = normalizedCdf - previousCdf;
+		sample.CdfProbability.x = normalizedCdf;
+		previousCdf = normalizedCdf;
+	}
+	distribution.back().CdfProbability.x = 1.0f;
+	WriteHostBuffer(
+		m_EnvironmentDistributionMemory,
+		distribution.data(),
+		distribution.size() * sizeof(GpuEnvironmentSample));
 	m_EnvironmentImage = std::move(environmentImage);
 	m_HasEnvironmentMap = true;
+	m_EnvironmentWidth = static_cast<uint32_t>(width);
+	m_EnvironmentHeight = static_cast<uint32_t>(height);
 	UpdateEnvironmentDescriptor();
 	ResetAccumulation();
 	return true;
@@ -1959,6 +2021,8 @@ void ComputeRenderer::ClearEnvironmentMap()
 		Walnut::ImageFormat::RGBA32F,
 		&blackPixel);
 	m_HasEnvironmentMap = false;
+	m_EnvironmentWidth = 0;
+	m_EnvironmentHeight = 0;
 	UpdateEnvironmentDescriptor();
 	ResetAccumulation();
 }
@@ -2825,7 +2889,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 {
 	VkDevice device = Walnut::Application::GetDevice();
 
-	VkDescriptorSetLayoutBinding descriptorBindings[10]{};
+	VkDescriptorSetLayoutBinding descriptorBindings[11]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorBindings[bindingIndex].binding = bindingIndex;
@@ -2852,10 +2916,14 @@ void ComputeRenderer::CreateComputeDescriptors()
 		VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 	descriptorBindings[9].descriptorCount = 1;
 	descriptorBindings[9].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	descriptorBindings[10].binding = 10;
+	descriptorBindings[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	descriptorBindings[10].descriptorCount = 1;
+	descriptorBindings[10].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 10;
+	layoutInfo.bindingCount = 11;
 	layoutInfo.pBindings = descriptorBindings;
 	check_vk_result(vkCreateDescriptorSetLayout(
 		device, &layoutInfo, nullptr, &m_ComputeDescriptorSetLayout));
@@ -2864,7 +2932,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	poolSizes[0].descriptorCount = 2;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSizes[1].descriptorCount = 5;
+	poolSizes[1].descriptorCount = 6;
 	poolSizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	poolSizes[2].descriptorCount = 2;
 	poolSizes[3].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -2944,6 +3012,17 @@ void ComputeRenderer::CreateComputeDescriptors()
 	accelerationWrite.descriptorType =
 		VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 	vkUpdateDescriptorSets(device, 1, &accelerationWrite, 0, nullptr);
+	VkDescriptorBufferInfo environmentBufferInfo{};
+	environmentBufferInfo.buffer = m_EnvironmentDistributionBuffer;
+	environmentBufferInfo.range = VK_WHOLE_SIZE;
+	VkWriteDescriptorSet environmentBufferWrite{};
+	environmentBufferWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	environmentBufferWrite.dstSet = m_ComputeDescriptorSet;
+	environmentBufferWrite.dstBinding = 10;
+	environmentBufferWrite.descriptorCount = 1;
+	environmentBufferWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	environmentBufferWrite.pBufferInfo = &environmentBufferInfo;
+	vkUpdateDescriptorSets(device, 1, &environmentBufferWrite, 0, nullptr);
 }
 
 void ComputeRenderer::UpdateTextureDescriptor()
@@ -3065,7 +3144,10 @@ void ComputeRenderer::Render()
 	pushConstants.EnvironmentRotation = glm::radians(m_EnvironmentRotation);
 	pushConstants.HasEnvironmentMap = m_HasEnvironmentMap ? 1u : 0u;
 	pushConstants.HardwareSettings = glm::uvec4(
-		m_UseRayQuery ? 1u : 0u, 0u, 0u, 0u);
+		m_UseRayQuery ? 1u : 0u,
+		m_EnvironmentWidth,
+		m_EnvironmentHeight,
+		m_HasEnvironmentMap ? 1u : 0u);
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
@@ -3201,6 +3283,8 @@ void ComputeRenderer::Release()
 	VkBuffer triangleBvhBuffer = m_TriangleBvhBuffer;
 	VkDeviceMemory triangleBvhBufferMemory = m_TriangleBvhBufferMemory;
 	VkQueryPool timestampQueryPool = m_TimestampQueryPool;
+	VkBuffer environmentDistributionBuffer = m_EnvironmentDistributionBuffer;
+	VkDeviceMemory environmentDistributionMemory = m_EnvironmentDistributionMemory;
 
 	Walnut::Application::SubmitResourceFree(
 		[pipeline, pipelineLayout, descriptorPool, descriptorSetLayout,
@@ -3209,7 +3293,8 @@ void ComputeRenderer::Release()
 			 sphereBuffer, sphereBufferMemory, bvhBuffer, bvhBufferMemory,
 			 lightBuffer, lightBufferMemory, triangleBuffer,
 			 triangleBufferMemory, triangleBvhBuffer,
-			 triangleBvhBufferMemory, timestampQueryPool]()
+			 triangleBvhBufferMemory, timestampQueryPool,
+			 environmentDistributionBuffer, environmentDistributionMemory]()
 		{
 			VkDevice device = Walnut::Application::GetDevice();
 			if (timestampQueryPool != VK_NULL_HANDLE)
@@ -3235,6 +3320,8 @@ void ComputeRenderer::Release()
 			vkFreeMemory(device, triangleBufferMemory, nullptr);
 			vkDestroyBuffer(device, triangleBvhBuffer, nullptr);
 			vkFreeMemory(device, triangleBvhBufferMemory, nullptr);
+			vkDestroyBuffer(device, environmentDistributionBuffer, nullptr);
+			vkFreeMemory(device, environmentDistributionMemory, nullptr);
 		});
 
 	m_OutputImage = VK_NULL_HANDLE;

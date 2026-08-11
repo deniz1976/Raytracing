@@ -281,7 +281,9 @@ public:
 			m_Renderer.SetEnvironmentRotation(environmentRotation);
 		ImGui::TextWrapped(
 			"HDR pixels become the background and indirect environment light. "
-			"Rotation turns the panorama around the vertical axis.");
+			"Bright directions are importance sampled and combined with diffuse "
+			"BSDF samples using MIS. Rotation turns the panorama around the "
+			"vertical axis.");
 
 		uint32_t sphereCount = m_Renderer.GetSphereCount();
 		ImGui::Text(

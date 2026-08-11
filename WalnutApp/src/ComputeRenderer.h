@@ -81,6 +81,7 @@ public:
 
 	static constexpr uint32_t MaxSphereCount = 512;
 	static constexpr uint32_t MaxTriangleCount = 4096;
+	static constexpr uint32_t MaxEnvironmentTexelCount = 262144;
 	static constexpr uint32_t MaxTriangleBvhNodeCount = 2 * MaxTriangleCount;
 
 	// A binary tree over N primitives needs at most 2N-1 nodes, so this capacity
@@ -344,6 +345,10 @@ private:
 	VkAccelerationStructureKHR m_Tlas = VK_NULL_HANDLE;
 	VkBuffer m_TlasInstanceBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_TlasInstanceMemory = VK_NULL_HANDLE;
+	VkBuffer m_EnvironmentDistributionBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_EnvironmentDistributionMemory = VK_NULL_HANDLE;
+	uint32_t m_EnvironmentWidth = 0;
+	uint32_t m_EnvironmentHeight = 0;
 
 	VkPipelineLayout m_ComputePipelineLayout = VK_NULL_HANDLE;
 	VkPipeline m_ComputePipeline = VK_NULL_HANDLE;

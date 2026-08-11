@@ -16,6 +16,7 @@ The default render starts at 1600 x 900 and then follows the live ImGui viewport
 - OBJ triangle models with transforms, triangle BVH acceleration and smooth normals
 - MTL diffuse colors, UV coordinates and `map_Kd` image textures
 - Radiance HDR environment maps with intensity and horizontal rotation controls
+- Luminance-weighted HDR environment importance sampling with BSDF MIS
 - ACES filmic tone mapping and standard linear-to-sRGB output conversion
 - Scene save/load with backward-compatible format versions
 - Free-look camera and live scene, light, render and performance panels
@@ -116,7 +117,7 @@ toggle accelerates triangles; analytic spheres continue to use the custom sphere
 
 This is an educational renderer, not a production DCC renderer. Notable deliberate
 limits include one loaded OBJ model, one diffuse model texture, no texture mipmaps,
-no environment importance sampling and no `VK_KHR_ray_tracing_pipeline` shader stages.
+no environment texture mipmaps and no `VK_KHR_ray_tracing_pipeline` shader stages.
 The sphere and triangle BVHs are built on the CPU; the triangle path can instead build
 a Vulkan BLAS/TLAS and traverse it from the same compute shader with ray queries.
 
