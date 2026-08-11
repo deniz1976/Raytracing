@@ -10,6 +10,13 @@
 class ComputeRenderer
 {
 public:
+	enum class MaterialType : uint32_t
+	{
+		Legacy = 0,
+		Diffuse = 1,
+		Metal = 2
+	};
+
 	struct Sphere
 	{
 		glm::vec3 Center;
@@ -17,6 +24,7 @@ public:
 		glm::vec3 Albedo;
 		float Reflectivity;
 		float Roughness;
+		MaterialType Type = MaterialType::Legacy;
 	};
 
 	struct AreaLight

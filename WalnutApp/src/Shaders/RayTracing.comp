@@ -9,7 +9,8 @@ struct SphereData
 {
 	vec4 CenterRadius;
 	vec4 AlbedoReflectivity;
-	vec4 RoughnessPadding;
+	// x is roughness and y is the material type written as a small exact float.
+	vec4 RoughnessMaterial;
 };
 
 layout(std430, set = 0, binding = 2) readonly buffer SphereBuffer
@@ -63,6 +64,9 @@ layout(push_constant) uniform PushConstants
 
 const int MAX_BOUNCES = 3;
 const float RAY_EPSILON = 0.001;
+const uint MATERIAL_LEGACY = 0u;
+const uint MATERIAL_DIFFUSE = 1u;
+const uint MATERIAL_METAL = 2u;
 
 // A stack entry is only worth pushing if the far child can still turn out to be
 // worth visiting, so both children go on and the near one comes off first. The
@@ -80,6 +84,7 @@ struct Material
 	vec3 Albedo;
 	float Reflectivity;
 	float Roughness;
+	uint Type;
 };
 
 struct AreaLight
@@ -136,7 +141,8 @@ Material GetSphereMaterial(SphereData sphere)
 	Material material;
 	material.Albedo = sphere.AlbedoReflectivity.xyz;
 	material.Reflectivity = sphere.AlbedoReflectivity.w;
-	material.Roughness = sphere.RoughnessPadding.x;
+	material.Roughness = sphere.RoughnessMaterial.x;
+	material.Type = uint(sphere.RoughnessMaterial.y);
 	return material;
 }
 
@@ -556,60 +562,69 @@ vec3 TraceRay(
 			break;
 		}
 
-		vec3 surfaceColor = CalculateAmbientLight(closestHit.SurfaceMaterial);
+		Material material = closestHit.SurfaceMaterial;
+		bool usesDiffuseLighting = material.Type != MATERIAL_METAL;
+		vec3 surfaceColor = vec3(0.0);
 
-		if (sampleOneLight && lightCount > 0u)
+		if (usesDiffuseLighting)
 		{
-			// One chosen light stands in for the whole list, so the shadow ray
-			// cost per bounce no longer grows with light count. The estimator is
-			// contribution / probability, which keeps the expected value equal to
-			// the full sum whatever the probabilities are, as long as the divisor
-			// is the probability actually used to pick. Trading exact shading for
-			// variance is what accumulation then averages away.
-			//
-			// The probabilities follow the light weights rather than being equal,
-			// so the lights that can contribute most are the ones usually picked.
-			// A bright light picked often is divided by a large probability and a
-			// dim one picked rarely by a small one, so the average is unchanged
-			// while the samples land closer to it.
-			uint lightIndex;
-			float selectionProbability;
-			if (SelectAreaLight(
-				lightCount,
-				randomState,
-				lightIndex,
-				selectionProbability))
+			surfaceColor = CalculateAmbientLight(material);
+
+			if (sampleOneLight && lightCount > 0u)
 			{
-				surfaceColor +=
-					SampleAreaLight(lightIndex, closestHit, randomState) /
-					selectionProbability;
-			}
-		}
-		else
-		{
-			// Every light is sampled independently and its contribution is
-			// summed, so light count multiplies the shadow ray cost per bounce.
-			for (uint lightIndex = 0; lightIndex < lightCount; lightIndex++)
-			{
-				surfaceColor += SampleAreaLight(
+				// One chosen light stands in for the whole list, so the shadow ray
+				// cost per bounce no longer grows with light count. Dividing by the
+				// probability keeps the expected value equal to the full light sum.
+				uint lightIndex;
+				float selectionProbability;
+				if (SelectAreaLight(
+					lightCount,
+					randomState,
 					lightIndex,
-					closestHit,
-					randomState);
+					selectionProbability))
+				{
+					surfaceColor +=
+						SampleAreaLight(lightIndex, closestHit, randomState) /
+						selectionProbability;
+				}
+			}
+			else
+			{
+				// Every light is sampled independently and its contribution is
+				// summed, so light count multiplies the shadow ray cost per bounce.
+				for (uint lightIndex = 0; lightIndex < lightCount; lightIndex++)
+				{
+					surfaceColor += SampleAreaLight(
+						lightIndex,
+						closestHit,
+						randomState);
+				}
 			}
 		}
 
-		float reflectivity = closestHit.SurfaceMaterial.Reflectivity;
-		accumulatedColor +=
-			throughput *
-			surfaceColor *
-			(1.0 - reflectivity);
+		if (material.Type == MATERIAL_DIFFUSE)
+		{
+			// Diffuse is intentionally the simplest material: direct and ambient
+			// light are its final answer, so it does not spend another bounce.
+			accumulatedColor += throughput * surfaceColor;
+			break;
+		}
+
+		float reflectivity = material.Reflectivity;
+		if (material.Type == MATERIAL_LEGACY)
+		{
+			// Old scene files keep the original hybrid model exactly: part of the
+			// energy uses diffuse lighting and the rest continues as a reflection.
+			accumulatedColor +=
+				throughput * surfaceColor * (1.0 - reflectivity);
+		}
 
 		if (reflectivity <= 0.0)
 			break;
 
-		throughput *=
-			closestHit.SurfaceMaterial.Albedo *
-			reflectivity;
+		// Metal has no Lambert term in this small model. Its albedo tints the
+		// reflected light, while reflection strength controls how much survives.
+		throughput *= material.Albedo * reflectivity;
 
 		ray.Origin =
 			closestHit.Position +
@@ -623,7 +638,7 @@ vec3 TraceRay(
 		if (dot(randomDirection, closestHit.Normal) < 0.0)
 			randomDirection = -randomDirection;
 
-		float roughness = closestHit.SurfaceMaterial.Roughness;
+		float roughness = material.Roughness;
 		ray.Direction = normalize(mix(
 			perfectReflection,
 			randomDirection,

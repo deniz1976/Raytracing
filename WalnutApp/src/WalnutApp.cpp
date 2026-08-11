@@ -245,6 +245,16 @@ public:
 			ComputeRenderer::Sphere sphere = m_Renderer.GetSphere(
 				static_cast<uint32_t>(m_SelectedSphereIndex));
 			bool sphereChanged = false;
+			int materialType = static_cast<int>(sphere.Type);
+			if (ImGui::Combo(
+				"Material",
+				&materialType,
+				"Legacy\0Diffuse\0Metal\0"))
+			{
+				sphere.Type =
+					static_cast<ComputeRenderer::MaterialType>(materialType);
+				sphereChanged = true;
+			}
 			sphereChanged |= ImGui::DragFloat3(
 				"Center",
 				&sphere.Center.x,
@@ -258,16 +268,42 @@ public:
 			sphereChanged |= ImGui::ColorEdit3(
 				"Albedo",
 				&sphere.Albedo.x);
-			sphereChanged |= ImGui::SliderFloat(
-				"Reflectivity",
-				&sphere.Reflectivity,
-				0.0f,
-				1.0f);
-			sphereChanged |= ImGui::SliderFloat(
-				"Roughness",
-				&sphere.Roughness,
-				0.0f,
-				1.0f);
+
+			if (sphere.Type == ComputeRenderer::MaterialType::Legacy)
+			{
+				ImGui::TextWrapped(
+					"Legacy preserves the original diffuse and reflection blend.");
+				sphereChanged |= ImGui::SliderFloat(
+					"Reflectivity",
+					&sphere.Reflectivity,
+					0.0f,
+					1.0f);
+				sphereChanged |= ImGui::SliderFloat(
+					"Roughness",
+					&sphere.Roughness,
+					0.0f,
+					1.0f);
+			}
+			else if (sphere.Type == ComputeRenderer::MaterialType::Diffuse)
+			{
+				ImGui::TextWrapped(
+					"Diffuse receives direct light and does not create a reflection ray.");
+			}
+			else
+			{
+				ImGui::TextWrapped(
+					"Metal reflects a tinted ray instead of using diffuse lighting.");
+				sphereChanged |= ImGui::SliderFloat(
+					"Reflection Strength",
+					&sphere.Reflectivity,
+					0.0f,
+					1.0f);
+				sphereChanged |= ImGui::SliderFloat(
+					"Roughness",
+					&sphere.Roughness,
+					0.0f,
+					1.0f);
+			}
 
 			if (sphereChanged)
 			{

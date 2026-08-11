@@ -40,7 +40,8 @@ namespace
 	{
 		glm::vec4 CenterRadius;
 		glm::vec4 AlbedoReflectivity;
-		glm::vec4 RoughnessPadding;
+		// x stores roughness and y stores MaterialType as an exact small integer.
+		glm::vec4 RoughnessMaterial;
 	};
 
 	static_assert(sizeof(GpuSphere) == 48);
@@ -177,6 +178,12 @@ namespace
 			std::clamp(result.Reflectivity, 0.0f, 1.0f);
 		result.Roughness =
 			std::clamp(result.Roughness, 0.0f, 1.0f);
+		if (result.Type != ComputeRenderer::MaterialType::Legacy &&
+			result.Type != ComputeRenderer::MaterialType::Diffuse &&
+			result.Type != ComputeRenderer::MaterialType::Metal)
+		{
+			result.Type = ComputeRenderer::MaterialType::Legacy;
+		}
 		return result;
 	}
 
@@ -394,25 +401,29 @@ void ComputeRenderer::CreateSceneBuffer()
 			1.0f,
 			{ 0.85f, 0.18f, 0.12f },
 			0.15f,
-			0.65f },
+			0.65f,
+			MaterialType::Diffuse },
 		Sphere{
 			{ -2.1f, 0.0f, -1.0f },
 			1.0f,
 			{ 0.12f, 0.35f, 0.85f },
-			0.75f,
-			0.05f },
+			0.9f,
+			0.05f,
+			MaterialType::Metal },
 		Sphere{
 			{ 2.1f, 0.0f, -1.0f },
 			1.0f,
 			{ 0.15f, 0.75f, 0.28f },
+			0.75f,
 			0.35f,
-			0.35f },
+			MaterialType::Metal },
 		Sphere{
 			{ 0.0f, -101.0f, 0.0f },
 			100.0f,
 			{ 0.55f, 0.55f, 0.55f },
 			0.15f,
-			0.55f }
+			0.55f,
+			MaterialType::Diffuse }
 	};
 
 	const VkDeviceSize bufferSize = sizeof(GpuSphere) * MaxSphereCount;
@@ -847,8 +858,12 @@ void ComputeRenderer::UploadSceneBuffer()
 			glm::vec4(sphere.Center, sphere.Radius);
 		gpuSpheres[sphereIndex].AlbedoReflectivity =
 			glm::vec4(sphere.Albedo, sphere.Reflectivity);
-		gpuSpheres[sphereIndex].RoughnessPadding =
-			glm::vec4(sphere.Roughness, 0.0f, 0.0f, 0.0f);
+		gpuSpheres[sphereIndex].RoughnessMaterial =
+			glm::vec4(
+				sphere.Roughness,
+				static_cast<float>(sphere.Type),
+				0.0f,
+				0.0f);
 	}
 
 	WriteHostBuffer(m_SphereBufferMemory, gpuSpheres.data(), sizeof(gpuSpheres));
@@ -933,7 +948,8 @@ bool ComputeRenderer::AddSphere()
 		1.0f,
 		{ 0.8f, 0.6f, 0.2f },
 		0.1f,
-		0.5f
+		0.5f,
+		MaterialType::Diffuse
 	});
 	UploadSceneBuffer();
 	ResetAccumulation();
@@ -978,7 +994,7 @@ bool ComputeRenderer::SaveScene(
 	}
 
 	file << std::setprecision(std::numeric_limits<float>::max_digits10);
-	file << "WALNUT_RAY_SCENE 4\n";
+	file << "WALNUT_RAY_SCENE 5\n";
 	file << "SPHERE_COUNT " << m_Spheres.size() << '\n';
 	for (const Sphere& sphere : m_Spheres)
 	{
@@ -1019,6 +1035,15 @@ bool ComputeRenderer::SaveScene(
 	// Exposure belongs in the file for the same reason the camera does: it is part
 	// of the picture the user set up, not of the machine they set it up on.
 	file << "EXPOSURE " << m_Exposure << '\n';
+	// Material types are appended as their own block, so the sphere lines remain
+	// byte-for-byte compatible with versions 1-4 and old fields never move.
+	file << "MATERIAL_COUNT " << m_Spheres.size() << '\n';
+	for (const Sphere& sphere : m_Spheres)
+	{
+		file << "MATERIAL "
+			<< static_cast<uint32_t>(sphere.Type)
+			<< '\n';
+	}
 	file.flush();
 
 	if (!file)
@@ -1046,7 +1071,7 @@ bool ComputeRenderer::LoadScene(
 	uint32_t version = 0;
 	if (!(file >> label >> version) ||
 		label != "WALNUT_RAY_SCENE" ||
-		version < 1 || version > 4)
+		version < 1 || version > 5)
 	{
 		errorMessage = "Scene header or version is invalid.";
 		return false;
@@ -1178,6 +1203,34 @@ bool ComputeRenderer::LoadScene(
 		}
 	}
 
+	// Version 5 appends one explicit material type per sphere. Older files keep
+	// the Legacy default, which preserves the exact hybrid shading they used when
+	// they were saved instead of guessing whether a reflective sphere was metal.
+	if (version >= 5)
+	{
+		uint64_t materialCount = 0;
+		if (!(file >> label >> materialCount) || label != "MATERIAL_COUNT" ||
+			materialCount != sphereCount)
+		{
+			errorMessage = "Material count is missing or does not match the spheres.";
+			return false;
+		}
+
+		for (uint64_t sphereIndex = 0; sphereIndex < materialCount; sphereIndex++)
+		{
+			uint32_t materialType = 0;
+			if (!(file >> label >> materialType) || label != "MATERIAL" ||
+				materialType > static_cast<uint32_t>(MaterialType::Metal))
+			{
+				errorMessage = "Material type is missing or invalid.";
+				return false;
+			}
+
+			loadedSpheres[static_cast<size_t>(sphereIndex)].Type =
+				static_cast<MaterialType>(materialType);
+		}
+	}
+
 	std::string unexpectedData;
 	if (file >> unexpectedData)
 	{
@@ -1195,6 +1248,7 @@ bool ComputeRenderer::LoadScene(
 	ResetAccumulation();
 	return true;
 }
+
 
 const ComputeRenderer::AreaLight& ComputeRenderer::GetLight(uint32_t index) const
 {
