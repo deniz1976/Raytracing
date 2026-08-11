@@ -40,7 +40,7 @@ namespace
 	{
 		glm::vec4 CenterRadius;
 		glm::vec4 AlbedoReflectivity;
-		// x stores roughness and y stores MaterialType as an exact small integer.
+		// x stores roughness, y stores MaterialType and z stores optical density.
 		glm::vec4 RoughnessMaterial;
 	};
 
@@ -178,9 +178,13 @@ namespace
 			std::clamp(result.Reflectivity, 0.0f, 1.0f);
 		result.Roughness =
 			std::clamp(result.Roughness, 0.0f, 1.0f);
+		result.IndexOfRefraction = std::isfinite(result.IndexOfRefraction)
+			? std::clamp(result.IndexOfRefraction, 1.0f, 2.5f)
+			: 1.5f;
 		if (result.Type != ComputeRenderer::MaterialType::Legacy &&
 			result.Type != ComputeRenderer::MaterialType::Diffuse &&
-			result.Type != ComputeRenderer::MaterialType::Metal)
+			result.Type != ComputeRenderer::MaterialType::Metal &&
+			result.Type != ComputeRenderer::MaterialType::Dielectric)
 		{
 			result.Type = ComputeRenderer::MaterialType::Legacy;
 		}
@@ -235,7 +239,8 @@ namespace
 			std::isfinite(sphere.Albedo.g) &&
 			std::isfinite(sphere.Albedo.b) &&
 			std::isfinite(sphere.Reflectivity) &&
-			std::isfinite(sphere.Roughness);
+			std::isfinite(sphere.Roughness) &&
+			std::isfinite(sphere.IndexOfRefraction);
 	}
 
 	bool IsFinite(const ComputeRenderer::AreaLight& light)
@@ -402,28 +407,32 @@ void ComputeRenderer::CreateSceneBuffer()
 			{ 0.85f, 0.18f, 0.12f },
 			0.15f,
 			0.65f,
-			MaterialType::Diffuse },
+			MaterialType::Diffuse,
+			1.5f },
 		Sphere{
 			{ -2.1f, 0.0f, -1.0f },
 			1.0f,
 			{ 0.12f, 0.35f, 0.85f },
 			0.9f,
 			0.05f,
-			MaterialType::Metal },
+			MaterialType::Metal,
+			1.5f },
 		Sphere{
 			{ 2.1f, 0.0f, -1.0f },
 			1.0f,
-			{ 0.15f, 0.75f, 0.28f },
-			0.75f,
-			0.35f,
-			MaterialType::Metal },
+			{ 0.92f, 1.0f, 0.95f },
+			1.0f,
+			0.0f,
+			MaterialType::Dielectric,
+			1.5f },
 		Sphere{
 			{ 0.0f, -101.0f, 0.0f },
 			100.0f,
 			{ 0.55f, 0.55f, 0.55f },
 			0.15f,
 			0.55f,
-			MaterialType::Diffuse }
+			MaterialType::Diffuse,
+			1.5f }
 	};
 
 	const VkDeviceSize bufferSize = sizeof(GpuSphere) * MaxSphereCount;
@@ -862,7 +871,7 @@ void ComputeRenderer::UploadSceneBuffer()
 			glm::vec4(
 				sphere.Roughness,
 				static_cast<float>(sphere.Type),
-				0.0f,
+				sphere.IndexOfRefraction,
 				0.0f);
 	}
 
@@ -949,7 +958,8 @@ bool ComputeRenderer::AddSphere()
 		{ 0.8f, 0.6f, 0.2f },
 		0.1f,
 		0.5f,
-		MaterialType::Diffuse
+		MaterialType::Diffuse,
+		1.5f
 	});
 	UploadSceneBuffer();
 	ResetAccumulation();
@@ -994,7 +1004,7 @@ bool ComputeRenderer::SaveScene(
 	}
 
 	file << std::setprecision(std::numeric_limits<float>::max_digits10);
-	file << "WALNUT_RAY_SCENE 5\n";
+	file << "WALNUT_RAY_SCENE 6\n";
 	file << "SPHERE_COUNT " << m_Spheres.size() << '\n';
 	for (const Sphere& sphere : m_Spheres)
 	{
@@ -1044,6 +1054,12 @@ bool ComputeRenderer::SaveScene(
 			<< static_cast<uint32_t>(sphere.Type)
 			<< '\n';
 	}
+	// Version 6 appends optical density independently from material type. Keeping
+	// the blocks separate lets version 5 files retain their explicit material
+	// choices while receiving the default glass density when they are loaded.
+	file << "IOR_COUNT " << m_Spheres.size() << '\n';
+	for (const Sphere& sphere : m_Spheres)
+		file << "IOR " << sphere.IndexOfRefraction << '\n';
 	file.flush();
 
 	if (!file)
@@ -1071,7 +1087,7 @@ bool ComputeRenderer::LoadScene(
 	uint32_t version = 0;
 	if (!(file >> label >> version) ||
 		label != "WALNUT_RAY_SCENE" ||
-		version < 1 || version > 5)
+		version < 1 || version > 6)
 	{
 		errorMessage = "Scene header or version is invalid.";
 		return false;
@@ -1220,7 +1236,7 @@ bool ComputeRenderer::LoadScene(
 		{
 			uint32_t materialType = 0;
 			if (!(file >> label >> materialType) || label != "MATERIAL" ||
-				materialType > static_cast<uint32_t>(MaterialType::Metal))
+				materialType > static_cast<uint32_t>(MaterialType::Dielectric))
 			{
 				errorMessage = "Material type is missing or invalid.";
 				return false;
@@ -1228,6 +1244,37 @@ bool ComputeRenderer::LoadScene(
 
 			loadedSpheres[static_cast<size_t>(sphereIndex)].Type =
 				static_cast<MaterialType>(materialType);
+		}
+	}
+
+	// Version 6 stores optical density after the material block. Version 5 already
+	// knows the material type but has no IOR, so the Sphere default of 1.5 remains.
+	if (version >= 6)
+	{
+		uint64_t iorCount = 0;
+		if (!(file >> label >> iorCount) || label != "IOR_COUNT" ||
+			iorCount != sphereCount)
+		{
+			errorMessage = "IOR count is missing or does not match the spheres.";
+			return false;
+		}
+
+		for (uint64_t sphereIndex = 0; sphereIndex < iorCount; sphereIndex++)
+		{
+			float indexOfRefraction = 0.0f;
+			if (!(file >> label >> indexOfRefraction) || label != "IOR")
+			{
+				errorMessage = "Index of refraction is missing or invalid.";
+				return false;
+			}
+			if (!std::isfinite(indexOfRefraction))
+			{
+				errorMessage = "Index of refraction is not a finite number.";
+				return false;
+			}
+
+			loadedSpheres[static_cast<size_t>(sphereIndex)].IndexOfRefraction =
+				std::clamp(indexOfRefraction, 1.0f, 2.5f);
 		}
 	}
 
@@ -1248,6 +1295,7 @@ bool ComputeRenderer::LoadScene(
 	ResetAccumulation();
 	return true;
 }
+
 
 
 const ComputeRenderer::AreaLight& ComputeRenderer::GetLight(uint32_t index) const

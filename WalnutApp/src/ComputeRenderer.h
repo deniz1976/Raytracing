@@ -14,7 +14,8 @@ public:
 	{
 		Legacy = 0,
 		Diffuse = 1,
-		Metal = 2
+		Metal = 2,
+		Dielectric = 3
 	};
 
 	struct Sphere
@@ -25,6 +26,7 @@ public:
 		float Reflectivity;
 		float Roughness;
 		MaterialType Type = MaterialType::Legacy;
+		float IndexOfRefraction = 1.5f;
 	};
 
 	struct AreaLight

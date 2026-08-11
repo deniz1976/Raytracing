@@ -9,7 +9,7 @@ struct SphereData
 {
 	vec4 CenterRadius;
 	vec4 AlbedoReflectivity;
-	// x is roughness and y is the material type written as a small exact float.
+	// x is roughness, y is material type and z is index of refraction.
 	vec4 RoughnessMaterial;
 };
 
@@ -67,6 +67,7 @@ const float RAY_EPSILON = 0.001;
 const uint MATERIAL_LEGACY = 0u;
 const uint MATERIAL_DIFFUSE = 1u;
 const uint MATERIAL_METAL = 2u;
+const uint MATERIAL_DIELECTRIC = 3u;
 
 // A stack entry is only worth pushing if the far child can still turn out to be
 // worth visiting, so both children go on and the near one comes off first. The
@@ -85,6 +86,7 @@ struct Material
 	float Reflectivity;
 	float Roughness;
 	uint Type;
+	float IndexOfRefraction;
 };
 
 struct AreaLight
@@ -100,6 +102,7 @@ struct HitRecord
 	float Distance;
 	vec3 Position;
 	vec3 Normal;
+	bool FrontFace;
 	Material SurfaceMaterial;
 };
 
@@ -124,6 +127,18 @@ float NextRandom(inout uint state)
 	return float(state) / 4294967295.0;
 }
 
+// Schlick's approximation turns the view angle and optical density into the
+// probability that glass reflects instead of refracts. It is cheap enough for a
+// ray tracer while reproducing the strong reflections seen at grazing angles.
+float SchlickReflectance(float cosine, float indexOfRefraction)
+{
+	float r0 =
+		(1.0 - indexOfRefraction) /
+		(1.0 + indexOfRefraction);
+	r0 *= r0;
+	return r0 + (1.0 - r0) * pow(1.0 - cosine, 5.0);
+}
+
 vec3 RandomUnitVector(inout uint state)
 {
 	float z = NextRandom(state) * 2.0 - 1.0;
@@ -143,6 +158,7 @@ Material GetSphereMaterial(SphereData sphere)
 	material.Reflectivity = sphere.AlbedoReflectivity.w;
 	material.Roughness = sphere.RoughnessMaterial.x;
 	material.Type = uint(sphere.RoughnessMaterial.y);
+	material.IndexOfRefraction = sphere.RoughnessMaterial.z;
 	return material;
 }
 
@@ -240,8 +256,12 @@ bool IntersectSphereRange(
 			hitAnything = true;
 			closestHit.Distance = hitDistance;
 			closestHit.Position = ray.Origin + ray.Direction * hitDistance;
-			closestHit.Normal = normalize(
+			vec3 outwardNormal = normalize(
 				closestHit.Position - sphere.CenterRadius.xyz);
+			closestHit.FrontFace = dot(ray.Direction, outwardNormal) < 0.0;
+			closestHit.Normal = closestHit.FrontFace
+				? outwardNormal
+				: -outwardNormal;
 			closestHit.SurfaceMaterial = GetSphereMaterial(sphere);
 		}
 	}
@@ -563,7 +583,9 @@ vec3 TraceRay(
 		}
 
 		Material material = closestHit.SurfaceMaterial;
-		bool usesDiffuseLighting = material.Type != MATERIAL_METAL;
+		bool usesDiffuseLighting =
+			material.Type == MATERIAL_LEGACY ||
+			material.Type == MATERIAL_DIFFUSE;
 		vec3 surfaceColor = vec3(0.0);
 
 		if (usesDiffuseLighting)
@@ -608,6 +630,40 @@ vec3 TraceRay(
 			// light are its final answer, so it does not spend another bounce.
 			accumulatedColor += throughput * surfaceColor;
 			break;
+		}
+
+		if (material.Type == MATERIAL_DIELECTRIC)
+		{
+			// Entering glass goes from air (1.0) to the material IOR; leaving it
+			// reverses that ratio. The oriented normal always opposes the ray.
+			float refractionRatio = closestHit.FrontFace
+				? 1.0 / material.IndexOfRefraction
+				: material.IndexOfRefraction;
+			vec3 unitDirection = normalize(ray.Direction);
+			float cosTheta = min(dot(-unitDirection, closestHit.Normal), 1.0);
+			float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+
+			// When Snell's law has no real solution, all energy must reflect. In
+			// every other case Schlick chooses between reflection and refraction.
+			bool cannotRefract = refractionRatio * sinTheta > 1.0;
+			float reflectionProbability = SchlickReflectance(
+				cosTheta,
+				material.IndexOfRefraction);
+			bool shouldReflect =
+				cannotRefract ||
+				reflectionProbability > NextRandom(randomState);
+
+			ray.Direction = shouldReflect
+				? normalize(reflect(unitDirection, closestHit.Normal))
+				: normalize(refract(
+					unitDirection,
+					closestHit.Normal,
+					refractionRatio));
+			// This small model uses albedo as a transmission tint. Offsetting along
+			// the new direction puts an entering ray inside and an exiting ray outside.
+			throughput *= material.Albedo;
+			ray.Origin = closestHit.Position + ray.Direction * RAY_EPSILON;
+			continue;
 		}
 
 		float reflectivity = material.Reflectivity;

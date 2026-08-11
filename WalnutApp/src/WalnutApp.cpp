@@ -249,7 +249,7 @@ public:
 			if (ImGui::Combo(
 				"Material",
 				&materialType,
-				"Legacy\0Diffuse\0Metal\0"))
+				"Legacy\0Diffuse\0Metal\0Dielectric\0"))
 			{
 				sphere.Type =
 					static_cast<ComputeRenderer::MaterialType>(materialType);
@@ -289,7 +289,7 @@ public:
 				ImGui::TextWrapped(
 					"Diffuse receives direct light and does not create a reflection ray.");
 			}
-			else
+			else if (sphere.Type == ComputeRenderer::MaterialType::Metal)
 			{
 				ImGui::TextWrapped(
 					"Metal reflects a tinted ray instead of using diffuse lighting.");
@@ -303,6 +303,16 @@ public:
 					&sphere.Roughness,
 					0.0f,
 					1.0f);
+			}
+			else
+			{
+				ImGui::TextWrapped(
+					"Dielectric refracts through the surface and reflects more at grazing angles.");
+				sphereChanged |= ImGui::SliderFloat(
+					"Index of Refraction",
+					&sphere.IndexOfRefraction,
+					1.0f,
+					2.5f);
 			}
 
 			if (sphereChanged)
