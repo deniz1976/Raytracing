@@ -52,6 +52,20 @@ layout(std430, set = 0, binding = 4) readonly buffer LightBuffer
 	SphereLightData Lights[];
 } u_LightBuffer;
 
+struct TriangleData
+{
+	vec4 Vertex0;
+	vec4 Vertex1;
+	vec4 Vertex2;
+	vec4 AlbedoReflectivity;
+	vec4 RoughnessMaterial;
+};
+
+layout(std430, set = 0, binding = 5) readonly buffer TriangleBuffer
+{
+	TriangleData Triangles[];
+} u_TriangleBuffer;
+
 layout(push_constant) uniform PushConstants
 {
 	vec4 CameraPosition;
@@ -61,6 +75,10 @@ layout(push_constant) uniform PushConstants
 	float Exposure;
 	uint SphereCount;
 	uvec4 SceneSettings;
+	uint TriangleCount;
+	uint Padding0;
+	uint Padding1;
+	uint Padding2;
 } u_PushConstants;
 
 const float RAY_EPSILON = 0.001;
@@ -351,6 +369,17 @@ Material GetSphereMaterial(SphereData sphere)
 	return material;
 }
 
+Material GetTriangleMaterial(TriangleData triangle)
+{
+	Material material;
+	material.Albedo = triangle.AlbedoReflectivity.xyz;
+	material.Reflectivity = triangle.AlbedoReflectivity.w;
+	material.Roughness = triangle.RoughnessMaterial.x;
+	material.Type = uint(triangle.RoughnessMaterial.y);
+	material.IndexOfRefraction = triangle.RoughnessMaterial.z;
+	return material;
+}
+
 float HitSphereGeometry(Ray ray, vec3 sphereCenter, float sphereRadius)
 {
 	vec3 originToCenter = ray.Origin - sphereCenter;
@@ -383,6 +412,68 @@ float HitSphere(Ray ray, SphereData sphere)
 		ray,
 		sphere.CenterRadius.xyz,
 		sphere.CenterRadius.w);
+}
+
+// Moller-Trumbore expresses the hit in the triangle's two edge directions.
+// The barycentric u/v checks reject points outside without constructing a plane.
+float HitTriangle(Ray ray, TriangleData triangle, out vec3 outwardNormal)
+{
+	vec3 vertex0 = triangle.Vertex0.xyz;
+	vec3 edge1 = triangle.Vertex1.xyz - vertex0;
+	vec3 edge2 = triangle.Vertex2.xyz - vertex0;
+	vec3 directionCrossEdge2 = cross(ray.Direction, edge2);
+	float determinant = dot(edge1, directionCrossEdge2);
+	outwardNormal = vec3(0.0);
+	if (abs(determinant) < 1e-8)
+		return -1.0;
+
+	float inverseDeterminant = 1.0 / determinant;
+	vec3 vertex0ToOrigin = ray.Origin - vertex0;
+	float barycentricU =
+		dot(vertex0ToOrigin, directionCrossEdge2) * inverseDeterminant;
+	if (barycentricU < 0.0 || barycentricU > 1.0)
+		return -1.0;
+
+	vec3 originCrossEdge1 = cross(vertex0ToOrigin, edge1);
+	float barycentricV =
+		dot(ray.Direction, originCrossEdge1) * inverseDeterminant;
+	if (barycentricV < 0.0 || barycentricU + barycentricV > 1.0)
+		return -1.0;
+
+	float hitDistance = dot(edge2, originCrossEdge1) * inverseDeterminant;
+	if (hitDistance <= RAY_EPSILON)
+		return -1.0;
+
+	vec3 normalCross = cross(edge1, edge2);
+	if (dot(normalCross, normalCross) <= 1e-16)
+		return -1.0;
+	outwardNormal = normalize(normalCross);
+	return hitDistance;
+}
+
+bool IntersectTriangles(Ray ray, inout HitRecord closestHit)
+{
+	bool hitAnything = false;
+	for (uint triangleIndex = 0u;
+		triangleIndex < u_PushConstants.TriangleCount;
+		triangleIndex++)
+	{
+		TriangleData triangle = u_TriangleBuffer.Triangles[triangleIndex];
+		vec3 outwardNormal;
+		float hitDistance = HitTriangle(ray, triangle, outwardNormal);
+		if (hitDistance > 0.0 && hitDistance < closestHit.Distance)
+		{
+			hitAnything = true;
+			closestHit.Distance = hitDistance;
+			closestHit.Position = ray.Origin + ray.Direction * hitDistance;
+			closestHit.FrontFace = dot(ray.Direction, outwardNormal) < 0.0;
+			closestHit.Normal = closestHit.FrontFace
+				? outwardNormal
+				: -outwardNormal;
+			closestHit.SurfaceMaterial = GetTriangleMaterial(triangle);
+		}
+	}
+	return hitAnything;
 }
 
 // A zero direction component would turn into an infinite reciprocal, and the
@@ -469,66 +560,64 @@ bool TraceScene(
 	out HitRecord closestHit)
 {
 	closestHit.Distance = 1e30;
+	bool hitAnything = false;
 
 	if (u_PushConstants.SceneSettings.x == 0u)
 	{
-		return IntersectSphereRange(
+		hitAnything = IntersectSphereRange(
 			ray,
 			0u,
 			u_PushConstants.SphereCount,
 			closestHit);
 	}
-
-	bool hitAnything = false;
-	vec3 inverseDirection = SafeInverseDirection(ray.Direction);
-
-	uint nodeStack[BVH_STACK_SIZE];
-	int stackSize = 0;
-	nodeStack[stackSize++] = 0u;
-
-	while (stackSize > 0)
+	else
 	{
-		BvhNodeData node = u_BvhBuffer.Nodes[nodeStack[--stackSize]];
+		vec3 inverseDirection = SafeInverseDirection(ray.Direction);
+		uint nodeStack[BVH_STACK_SIZE];
+		int stackSize = 0;
+		nodeStack[stackSize++] = 0u;
 
-		if (!HitAabb(
-			ray.Origin,
-			inverseDirection,
-			node.BoundsMin.xyz,
-			node.BoundsMax.xyz,
-			closestHit.Distance))
+		while (stackSize > 0)
 		{
-			continue;
-		}
+			BvhNodeData node = u_BvhBuffer.Nodes[nodeStack[--stackSize]];
 
-		if (node.Links.z > 0u)
-		{
-			if (IntersectSphereRange(
-				ray,
-				node.Links.x,
-				node.Links.z,
-				closestHit))
+			if (!HitAabb(
+				ray.Origin,
+				inverseDirection,
+				node.BoundsMin.xyz,
+				node.BoundsMax.xyz,
+				closestHit.Distance))
 			{
-				hitAnything = true;
+				continue;
 			}
-			continue;
-		}
 
-		if (stackSize + 2 <= BVH_STACK_SIZE)
-		{
-			// The left child holds the smaller coordinates along the split axis, so
-			// a ray travelling in the positive direction on that axis reaches it
-			// first. Visiting the near child first is what makes the pruning above
-			// pay off: any surface found in it shrinks closestHit.Distance before
-			// the far box is ever tested, and a far box behind that surface is then
-			// rejected outright. Popping happens in reverse, so the far child is
-			// the one pushed first.
-			int splitAxis = int(node.Links.w);
-			bool leftIsNear = ray.Direction[splitAxis] >= 0.0;
+			if (node.Links.z > 0u)
+			{
+				if (IntersectSphereRange(
+					ray,
+					node.Links.x,
+					node.Links.z,
+					closestHit))
+				{
+					hitAnything = true;
+				}
+				continue;
+			}
 
-			nodeStack[stackSize++] = leftIsNear ? node.Links.y : node.Links.x;
-			nodeStack[stackSize++] = leftIsNear ? node.Links.x : node.Links.y;
+			if (stackSize + 2 <= BVH_STACK_SIZE)
+			{
+				int splitAxis = int(node.Links.w);
+				bool leftIsNear = ray.Direction[splitAxis] >= 0.0;
+				nodeStack[stackSize++] = leftIsNear
+					? node.Links.y : node.Links.x;
+				nodeStack[stackSize++] = leftIsNear
+					? node.Links.x : node.Links.y;
+			}
 		}
 	}
+
+	if (IntersectTriangles(ray, closestHit))
+		hitAnything = true;
 
 	return hitAnything;
 }
@@ -542,6 +631,22 @@ bool IsOccluded(
 	Ray shadowRay;
 	shadowRay.Origin = surfacePosition + surfaceNormal * RAY_EPSILON;
 	shadowRay.Direction = directionToLight;
+
+	for (uint triangleIndex = 0u;
+		triangleIndex < u_PushConstants.TriangleCount;
+		triangleIndex++)
+	{
+		vec3 outwardNormal;
+		float hitDistance = HitTriangle(
+			shadowRay,
+			u_TriangleBuffer.Triangles[triangleIndex],
+			outwardNormal);
+		if (hitDistance > 0.0 &&
+			hitDistance < maximumDistance - RAY_EPSILON)
+		{
+			return true;
+		}
+	}
 
 	if (u_PushConstants.SceneSettings.x == 0u)
 	{

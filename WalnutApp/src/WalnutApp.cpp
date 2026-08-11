@@ -221,6 +221,10 @@ public:
 
 		uint32_t sphereCount = m_Renderer.GetSphereCount();
 		ImGui::Text(
+			"Triangles: %u / %u (model geometry preview)",
+			m_Renderer.GetTriangleCount(),
+			ComputeRenderer::MaxTriangleCount);
+		ImGui::Text(
 			"Spheres: %u / %u",
 			sphereCount,
 			ComputeRenderer::MaxSphereCount);

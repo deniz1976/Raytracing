@@ -30,11 +30,15 @@ namespace
 		float Exposure;
 		uint32_t SphereCount;
 		glm::uvec4 SceneSettings;
+		uint32_t TriangleCount;
+		uint32_t Padding0;
+		uint32_t Padding1;
+		uint32_t Padding2;
 	};
 
-	// Moving the light out of the push constant and into a storage buffer took
-	// this back down to 64 bytes, half of the 128 bytes Vulkan guarantees.
-	static_assert(sizeof(PushConstants) == 64);
+	// The triangle count grows this from 64 to 80 bytes, still leaving 48 bytes
+	// inside the 128-byte push constant capacity Vulkan guarantees.
+	static_assert(sizeof(PushConstants) == 80);
 
 	struct alignas(16) GpuSphere
 	{
@@ -45,6 +49,17 @@ namespace
 	};
 
 	static_assert(sizeof(GpuSphere) == 48);
+
+	struct alignas(16) GpuTriangle
+	{
+		glm::vec4 Vertex0;
+		glm::vec4 Vertex1;
+		glm::vec4 Vertex2;
+		glm::vec4 AlbedoReflectivity;
+		glm::vec4 RoughnessMaterial;
+	};
+
+	static_assert(sizeof(GpuTriangle) == 80);
 
 	// One node of the bounding volume hierarchy. An interior node stores the two
 	// child indices and a SphereCount of zero; a leaf stores the first sphere in
@@ -437,7 +452,30 @@ void ComputeRenderer::CreateSceneBuffer()
 
 	CreateBvhBuffer();
 	CreateLightBuffer();
+	CreateTriangleBuffer();
 	UploadSceneBuffer();
+}
+
+void ComputeRenderer::CreateTriangleBuffer()
+{
+	// A first standalone triangle proves that the renderer supports planar
+	// primitives before model loading and triangle BVH construction are added.
+	m_Triangles = {
+		Triangle{
+			{ -1.25f, 0.1f, -3.0f },
+			{ 1.25f, 0.1f, -3.0f },
+			{ 0.0f, 2.2f, -3.0f },
+			{ 0.8f, 0.65f, 0.15f },
+			0.0f,
+			0.5f,
+			MaterialType::Diffuse,
+			1.5f }
+	};
+
+	const VkDeviceSize bufferSize =
+		sizeof(GpuTriangle) * MaxTriangleCount;
+	CreateHostBuffer(bufferSize, m_TriangleBuffer, m_TriangleBufferMemory);
+	UploadTriangleBuffer();
 }
 
 void ComputeRenderer::CreateBvhBuffer()
@@ -930,6 +968,33 @@ void ComputeRenderer::UploadLightBuffer()
 	}
 
 	WriteHostBuffer(m_LightBufferMemory, gpuLights.data(), sizeof(gpuLights));
+}
+
+void ComputeRenderer::UploadTriangleBuffer()
+{
+	std::array<GpuTriangle, MaxTriangleCount> gpuTriangles{};
+	for (size_t triangleIndex = 0;
+		triangleIndex < m_Triangles.size();
+		triangleIndex++)
+	{
+		const Triangle& triangle = m_Triangles[triangleIndex];
+		GpuTriangle& gpuTriangle = gpuTriangles[triangleIndex];
+		gpuTriangle.Vertex0 = glm::vec4(triangle.Vertex0, 0.0f);
+		gpuTriangle.Vertex1 = glm::vec4(triangle.Vertex1, 0.0f);
+		gpuTriangle.Vertex2 = glm::vec4(triangle.Vertex2, 0.0f);
+		gpuTriangle.AlbedoReflectivity =
+			glm::vec4(triangle.Albedo, triangle.Reflectivity);
+		gpuTriangle.RoughnessMaterial = glm::vec4(
+			triangle.Roughness,
+			static_cast<float>(triangle.Type),
+			triangle.IndexOfRefraction,
+			0.0f);
+	}
+
+	WriteHostBuffer(
+		m_TriangleBufferMemory,
+		gpuTriangles.data(),
+		sizeof(gpuTriangles));
 }
 
 const ComputeRenderer::Sphere& ComputeRenderer::GetSphere(uint32_t index) const
@@ -1675,7 +1740,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 {
 	VkDevice device = Walnut::Application::GetDevice();
 
-	VkDescriptorSetLayoutBinding descriptorBindings[5]{};
+	VkDescriptorSetLayoutBinding descriptorBindings[6]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorBindings[bindingIndex].binding = bindingIndex;
@@ -1683,7 +1748,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorBindings[bindingIndex].descriptorCount = 1;
 		descriptorBindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 	}
-	for (uint32_t bindingIndex = 2; bindingIndex < 5; bindingIndex++)
+	for (uint32_t bindingIndex = 2; bindingIndex < 6; bindingIndex++)
 	{
 		descriptorBindings[bindingIndex].binding = bindingIndex;
 		descriptorBindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1693,7 +1758,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 5;
+	layoutInfo.bindingCount = 6;
 	layoutInfo.pBindings = descriptorBindings;
 	check_vk_result(vkCreateDescriptorSetLayout(
 		device, &layoutInfo, nullptr, &m_ComputeDescriptorSetLayout));
@@ -1702,7 +1767,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	poolSizes[0].descriptorCount = 2;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSizes[1].descriptorCount = 3;
+	poolSizes[1].descriptorCount = 4;
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1725,7 +1790,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 	descriptorImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 	descriptorImages[1].imageView = m_AccumulationImageView;
 	descriptorImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-	VkDescriptorBufferInfo descriptorBuffers[3]{};
+	VkDescriptorBufferInfo descriptorBuffers[4]{};
 	descriptorBuffers[0].buffer = m_SphereBuffer;
 	descriptorBuffers[0].offset = 0;
 	descriptorBuffers[0].range = VK_WHOLE_SIZE;
@@ -1735,8 +1800,11 @@ void ComputeRenderer::CreateComputeDescriptors()
 	descriptorBuffers[2].buffer = m_LightBuffer;
 	descriptorBuffers[2].offset = 0;
 	descriptorBuffers[2].range = VK_WHOLE_SIZE;
+	descriptorBuffers[3].buffer = m_TriangleBuffer;
+	descriptorBuffers[3].offset = 0;
+	descriptorBuffers[3].range = VK_WHOLE_SIZE;
 
-	VkWriteDescriptorSet descriptorWrites[5]{};
+	VkWriteDescriptorSet descriptorWrites[6]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorWrites[bindingIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1746,7 +1814,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorWrites[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 		descriptorWrites[bindingIndex].pImageInfo = &descriptorImages[bindingIndex];
 	}
-	for (uint32_t bindingIndex = 2; bindingIndex < 5; bindingIndex++)
+	for (uint32_t bindingIndex = 2; bindingIndex < 6; bindingIndex++)
 	{
 		descriptorWrites[bindingIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 		descriptorWrites[bindingIndex].dstSet = m_ComputeDescriptorSet;
@@ -1755,7 +1823,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorWrites[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 		descriptorWrites[bindingIndex].pBufferInfo = &descriptorBuffers[bindingIndex - 2];
 	}
-	vkUpdateDescriptorSets(device, 5, descriptorWrites, 0, nullptr);
+	vkUpdateDescriptorSets(device, 6, descriptorWrites, 0, nullptr);
 }
 
 void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)
@@ -1822,6 +1890,7 @@ void ComputeRenderer::Render()
 		GetLightCount(),
 		m_UseStochasticLights ? 1u : 0u,
 		m_BounceCount);
+	pushConstants.TriangleCount = GetTriangleCount();
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
@@ -1950,14 +2019,17 @@ void ComputeRenderer::Release()
 	VkDeviceMemory bvhBufferMemory = m_BvhBufferMemory;
 	VkBuffer lightBuffer = m_LightBuffer;
 	VkDeviceMemory lightBufferMemory = m_LightBufferMemory;
+	VkBuffer triangleBuffer = m_TriangleBuffer;
+	VkDeviceMemory triangleBufferMemory = m_TriangleBufferMemory;
 	VkQueryPool timestampQueryPool = m_TimestampQueryPool;
 
 	Walnut::Application::SubmitResourceFree(
 		[pipeline, pipelineLayout, descriptorPool, descriptorSetLayout,
 		 sampler, outputImageView, outputImage, outputImageMemory,
 		 accumulationImageView, accumulationImage, accumulationImageMemory,
-		 sphereBuffer, sphereBufferMemory, bvhBuffer, bvhBufferMemory,
-		 lightBuffer, lightBufferMemory, timestampQueryPool]()
+			 sphereBuffer, sphereBufferMemory, bvhBuffer, bvhBufferMemory,
+			 lightBuffer, lightBufferMemory, triangleBuffer,
+			 triangleBufferMemory, timestampQueryPool]()
 		{
 			VkDevice device = Walnut::Application::GetDevice();
 			if (timestampQueryPool != VK_NULL_HANDLE)
@@ -1979,6 +2051,8 @@ void ComputeRenderer::Release()
 			vkFreeMemory(device, bvhBufferMemory, nullptr);
 			vkDestroyBuffer(device, lightBuffer, nullptr);
 			vkFreeMemory(device, lightBufferMemory, nullptr);
+			vkDestroyBuffer(device, triangleBuffer, nullptr);
+			vkFreeMemory(device, triangleBufferMemory, nullptr);
 		});
 
 	m_OutputImage = VK_NULL_HANDLE;

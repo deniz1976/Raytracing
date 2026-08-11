@@ -37,6 +37,18 @@ public:
 		float Intensity;
 	};
 
+	struct Triangle
+	{
+		glm::vec3 Vertex0;
+		glm::vec3 Vertex1;
+		glm::vec3 Vertex2;
+		glm::vec3 Albedo;
+		float Reflectivity;
+		float Roughness;
+		MaterialType Type = MaterialType::Diffuse;
+		float IndexOfRefraction = 1.5f;
+	};
+
 	// Yaw and pitch are stored in degrees instead of a forward vector because
 	// they are what the UI edits and what a scene file can round trip; the
 	// renderer derives the forward vector from them.
@@ -49,6 +61,7 @@ public:
 	};
 
 	static constexpr uint32_t MaxSphereCount = 512;
+	static constexpr uint32_t MaxTriangleCount = 4096;
 
 	// A binary tree over N primitives needs at most 2N-1 nodes, so this capacity
 	// can always hold a tree built over MaxSphereCount spheres.
@@ -114,6 +127,7 @@ public:
 	uint32_t GetHeight() const { return m_Height; }
 	uint32_t GetFrameIndex() const { return m_FrameIndex; }
 	uint32_t GetSphereCount() const { return static_cast<uint32_t>(m_Spheres.size()); }
+	uint32_t GetTriangleCount() const { return static_cast<uint32_t>(m_Triangles.size()); }
 	uint32_t GetLightCount() const { return static_cast<uint32_t>(m_Lights.size()); }
 	uint32_t GetBvhNodeCount() const { return m_BvhNodeCount; }
 	uint32_t GetBvhDepth() const { return m_BvhDepth; }
@@ -141,6 +155,7 @@ private:
 	void CreateSceneBuffer();
 	void CreateBvhBuffer();
 	void CreateLightBuffer();
+	void CreateTriangleBuffer();
 	void CreateHostBuffer(
 		VkDeviceSize size,
 		VkBuffer& buffer,
@@ -151,6 +166,7 @@ private:
 		VkDeviceSize size) const;
 	void UploadSceneBuffer();
 	void UploadLightBuffer();
+	void UploadTriangleBuffer();
 
 	// What the surface area heuristic concluded about one range of spheres.
 	// NoCandidate is not a failure: it means every centroid fell on the same
@@ -196,6 +212,7 @@ private:
 	float m_Exposure = 1.0f;
 	uint32_t m_BounceCount = 3;
 	std::vector<Sphere> m_Spheres;
+	std::vector<Triangle> m_Triangles;
 	std::vector<SphereLight> m_Lights;
 
 	bool m_UseBvh = true;
@@ -235,6 +252,9 @@ private:
 
 	VkBuffer m_LightBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_LightBufferMemory = VK_NULL_HANDLE;
+
+	VkBuffer m_TriangleBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_TriangleBufferMemory = VK_NULL_HANDLE;
 
 	VkImage m_OutputImage = VK_NULL_HANDLE;
 	VkDeviceMemory m_OutputImageMemory = VK_NULL_HANDLE;
