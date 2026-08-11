@@ -43,9 +43,10 @@ public:
 		// The renderer already derives this from the current yaw and pitch, so
 		// the movement directions never disagree with the traced view.
 		const glm::vec3 forward = m_Renderer.GetCameraForward();
+		const glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
 		const glm::vec3 right = glm::normalize(glm::cross(
 			forward,
-			glm::vec3(0.0f, 1.0f, 0.0f)));
+			worldUp));
 
 		glm::vec3 movement(0.0f);
 		if (Walnut::Input::IsKeyDown(Walnut::KeyCode::W))
@@ -56,6 +57,10 @@ public:
 			movement += right;
 		if (Walnut::Input::IsKeyDown(Walnut::KeyCode::A))
 			movement -= right;
+		if (Walnut::Input::IsKeyDown(Walnut::KeyCode::E))
+			movement += worldUp;
+		if (Walnut::Input::IsKeyDown(Walnut::KeyCode::Q))
+			movement -= worldUp;
 
 		if (glm::dot(movement, movement) > 0.0f)
 		{
@@ -148,7 +153,8 @@ public:
 		{
 			SetMouseLookEnabled(!m_MouseLookEnabled);
 		}
-		ImGui::TextWrapped("WASD: Move | Mouse: Look | Esc: Release");
+		ImGui::TextWrapped(
+			"WASD: Move | Q/E: Down/Up | Mouse: Look | Esc: Release");
 
 		if (cameraChanged)
 			m_Renderer.SetCamera(camera);
@@ -541,6 +547,11 @@ private:
 
 		m_MouseLookEnabled = enabled;
 		m_HasMousePosition = false;
+		ImGuiIO& io = ImGui::GetIO();
+		if (enabled)
+			io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
+		else
+			io.ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
 		Walnut::Input::SetCursorMode(
 			enabled
 				? Walnut::CursorMode::Locked
