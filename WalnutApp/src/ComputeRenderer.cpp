@@ -39,9 +39,9 @@ namespace
 		uint32_t SphereCount;
 		glm::uvec4 SceneSettings;
 		uint32_t TriangleCount;
-		uint32_t Padding0;
-		uint32_t Padding1;
-		uint32_t Padding2;
+		float EnvironmentIntensity;
+		float EnvironmentRotation;
+		uint32_t HasEnvironmentMap;
 	};
 
 	// The triangle count grows this from 64 to 80 bytes, still leaving 48 bytes
@@ -347,6 +347,12 @@ void ComputeRenderer::Init(const std::string& shaderPath, uint32_t width, uint32
 		1,
 		Walnut::ImageFormat::RGBA,
 		&whitePixel);
+	const glm::vec4 blackPixel(0.0f);
+	m_EnvironmentImage = std::make_unique<Walnut::Image>(
+		1,
+		1,
+		Walnut::ImageFormat::RGBA32F,
+		&blackPixel);
 	CreateComputeDescriptors();
 	CreateComputePipeline(shaderPath);
 	CreateTimestampQueryPool();
@@ -1619,6 +1625,74 @@ bool ComputeRenderer::LoadObj(
 	return true;
 }
 
+bool ComputeRenderer::LoadEnvironmentMap(
+	const std::string& path,
+	std::string& errorMessage)
+{
+	errorMessage.clear();
+	if (path.empty())
+	{
+		errorMessage = "Environment path is empty.";
+		return false;
+	}
+
+	if (!stbi_is_hdr(path.c_str()))
+	{
+		errorMessage = "Environment image must be a Radiance HDR file.";
+		return false;
+	}
+
+	int width = 0;
+	int height = 0;
+	int channels = 0;
+	if (!stbi_info(path.c_str(), &width, &height, &channels) ||
+		width <= 0 || height <= 0)
+	{
+		errorMessage = "Environment image could not be decoded: " + path;
+		return false;
+	}
+
+	auto environmentImage = std::make_unique<Walnut::Image>(path);
+	m_EnvironmentImage = std::move(environmentImage);
+	m_HasEnvironmentMap = true;
+	UpdateEnvironmentDescriptor();
+	ResetAccumulation();
+	return true;
+}
+
+void ComputeRenderer::ClearEnvironmentMap()
+{
+	const glm::vec4 blackPixel(0.0f);
+	m_EnvironmentImage = std::make_unique<Walnut::Image>(
+		1,
+		1,
+		Walnut::ImageFormat::RGBA32F,
+		&blackPixel);
+	m_HasEnvironmentMap = false;
+	UpdateEnvironmentDescriptor();
+	ResetAccumulation();
+}
+
+void ComputeRenderer::SetEnvironmentIntensity(float intensity)
+{
+	const float clampedIntensity = std::clamp(intensity, 0.0f, 20.0f);
+	if (m_EnvironmentIntensity == clampedIntensity)
+		return;
+
+	m_EnvironmentIntensity = clampedIntensity;
+	ResetAccumulation();
+}
+
+void ComputeRenderer::SetEnvironmentRotation(float rotationDegrees)
+{
+	const float wrappedRotation = std::fmod(rotationDegrees, 360.0f);
+	if (m_EnvironmentRotation == wrappedRotation)
+		return;
+
+	m_EnvironmentRotation = wrappedRotation;
+	ResetAccumulation();
+}
+
 void ComputeRenderer::SetModelTransform(const ModelTransform& transform)
 {
 	ModelTransform sanitized = transform;
@@ -2461,7 +2535,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 {
 	VkDevice device = Walnut::Application::GetDevice();
 
-	VkDescriptorSetLayoutBinding descriptorBindings[8]{};
+	VkDescriptorSetLayoutBinding descriptorBindings[9]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorBindings[bindingIndex].binding = bindingIndex;
@@ -2481,10 +2555,12 @@ void ComputeRenderer::CreateComputeDescriptors()
 		VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	descriptorBindings[7].descriptorCount = 1;
 	descriptorBindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	descriptorBindings[8] = descriptorBindings[7];
+	descriptorBindings[8].binding = 8;
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 8;
+	layoutInfo.bindingCount = 9;
 	layoutInfo.pBindings = descriptorBindings;
 	check_vk_result(vkCreateDescriptorSetLayout(
 		device, &layoutInfo, nullptr, &m_ComputeDescriptorSetLayout));
@@ -2495,7 +2571,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	poolSizes[1].descriptorCount = 5;
 	poolSizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	poolSizes[2].descriptorCount = 1;
+	poolSizes[2].descriptorCount = 2;
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -2556,6 +2632,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 	}
 	vkUpdateDescriptorSets(device, 7, descriptorWrites, 0, nullptr);
 	UpdateTextureDescriptor();
+	UpdateEnvironmentDescriptor();
 }
 
 void ComputeRenderer::UpdateTextureDescriptor()
@@ -2579,6 +2656,31 @@ void ComputeRenderer::UpdateTextureDescriptor()
 		Walnut::Application::GetDevice(),
 		1,
 		&textureWrite,
+		0,
+		nullptr);
+}
+
+void ComputeRenderer::UpdateEnvironmentDescriptor()
+{
+	if (m_ComputeDescriptorSet == VK_NULL_HANDLE || !m_EnvironmentImage)
+		return;
+
+	VkDescriptorImageInfo imageInfo{};
+	imageInfo.sampler = m_EnvironmentImage->GetSampler();
+	imageInfo.imageView = m_EnvironmentImage->GetImageView();
+	imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	VkWriteDescriptorSet descriptorWrite{};
+	descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	descriptorWrite.dstSet = m_ComputeDescriptorSet;
+	descriptorWrite.dstBinding = 8;
+	descriptorWrite.descriptorCount = 1;
+	descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	descriptorWrite.pImageInfo = &imageInfo;
+	vkUpdateDescriptorSets(
+		Walnut::Application::GetDevice(),
+		1,
+		&descriptorWrite,
 		0,
 		nullptr);
 }
@@ -2648,6 +2750,9 @@ void ComputeRenderer::Render()
 		m_UseStochasticLights ? 1u : 0u,
 		m_BounceCount);
 	pushConstants.TriangleCount = GetTriangleCount();
+	pushConstants.EnvironmentIntensity = m_EnvironmentIntensity;
+	pushConstants.EnvironmentRotation = glm::radians(m_EnvironmentRotation);
+	pushConstants.HasEnvironmentMap = m_HasEnvironmentMap ? 1u : 0u;
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 

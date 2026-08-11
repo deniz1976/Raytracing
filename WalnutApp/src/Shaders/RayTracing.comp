@@ -79,6 +79,7 @@ layout(std430, set = 0, binding = 6) readonly buffer TriangleBvhBuffer
 } u_TriangleBvhBuffer;
 
 layout(set = 0, binding = 7) uniform sampler2D u_ModelTexture;
+layout(set = 0, binding = 8) uniform sampler2D u_EnvironmentTexture;
 
 layout(push_constant) uniform PushConstants
 {
@@ -90,9 +91,9 @@ layout(push_constant) uniform PushConstants
 	uint SphereCount;
 	uvec4 SceneSettings;
 	uint TriangleCount;
-	uint Padding0;
-	uint Padding1;
-	uint Padding2;
+	float EnvironmentIntensity;
+	float EnvironmentRotation;
+	uint HasEnvironmentMap;
 } u_PushConstants;
 
 const float RAY_EPSILON = 0.001;
@@ -1138,10 +1139,23 @@ vec3 SampleSphereLight(
 
 vec3 GetSkyColor(vec3 rayDirection)
 {
+	if (u_PushConstants.HasEnvironmentMap != 0u)
+	{
+		float longitude = atan(rayDirection.z, rayDirection.x) +
+			u_PushConstants.EnvironmentRotation;
+		float latitude = asin(clamp(rayDirection.y, -1.0, 1.0));
+		vec2 environmentUv = vec2(
+			longitude / (2.0 * PI) + 0.5,
+			0.5 - latitude / PI);
+		return texture(u_EnvironmentTexture, environmentUv).rgb *
+			u_PushConstants.EnvironmentIntensity;
+	}
+
 	float skyBlend = 0.5 * (rayDirection.y + 1.0);
 	vec3 horizonColor = vec3(1.0);
 	vec3 skyColor = vec3(0.5, 0.7, 1.0);
-	return mix(horizonColor, skyColor, skyBlend);
+	return mix(horizonColor, skyColor, skyBlend) *
+		u_PushConstants.EnvironmentIntensity;
 }
 
 vec3 ToneMapReinhard(vec3 hdrColor)

@@ -118,6 +118,12 @@ public:
 	bool SaveScene(const std::string& path, std::string& errorMessage) const;
 	bool LoadScene(const std::string& path, std::string& errorMessage);
 	bool LoadObj(const std::string& path, std::string& errorMessage);
+	bool LoadEnvironmentMap(const std::string& path, std::string& errorMessage);
+	void ClearEnvironmentMap();
+	float GetEnvironmentIntensity() const { return m_EnvironmentIntensity; }
+	void SetEnvironmentIntensity(float intensity);
+	float GetEnvironmentRotation() const { return m_EnvironmentRotation; }
+	void SetEnvironmentRotation(float rotationDegrees);
 	const std::string& GetModelPath() const { return m_ModelPath; }
 	const ModelTransform& GetModelTransform() const { return m_ModelTransform; }
 	void SetModelTransform(const ModelTransform& transform);
@@ -222,6 +228,7 @@ private:
 	void BuildBvh();
 	void CreateComputeDescriptors();
 	void UpdateTextureDescriptor();
+	void UpdateEnvironmentDescriptor();
 	void CreateComputePipeline(const std::string& shaderPath);
 	void CreateTimestampQueryPool();
 	void ReadGpuComputeTime();
@@ -246,6 +253,10 @@ private:
 	std::vector<Triangle> m_ModelTriangles;
 	std::string m_ModelPath;
 	std::unique_ptr<Walnut::Image> m_TextureImage;
+	std::unique_ptr<Walnut::Image> m_EnvironmentImage;
+	bool m_HasEnvironmentMap = false;
+	float m_EnvironmentIntensity = 1.0f;
+	float m_EnvironmentRotation = 0.0f;
 	ModelTransform m_ModelTransform;
 	std::vector<uint32_t> m_TriangleOrder;
 	uint32_t m_TriangleBvhNodeCount = 0;

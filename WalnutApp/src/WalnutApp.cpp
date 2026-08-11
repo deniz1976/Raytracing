@@ -38,6 +38,9 @@ public:
 		{
 			m_SceneStatus = "OBJ load failed: " + errorMessage;
 		}
+		if (!m_Renderer.LoadEnvironmentMap(
+			m_EnvironmentPath.data(), errorMessage))
+			m_SceneStatus = "Initial HDR load failed: " + errorMessage;
 	}
 
 	virtual void OnDetach() override
@@ -242,6 +245,40 @@ public:
 
 		if (!m_SceneStatus.empty())
 			ImGui::TextWrapped("%s", m_SceneStatus.c_str());
+
+		ImGui::Separator();
+		ImGui::Text("Environment");
+		ImGui::SetNextItemWidth(300.0f);
+		ImGui::InputText(
+			"HDR Path",
+			m_EnvironmentPath.data(),
+			m_EnvironmentPath.size());
+		if (ImGui::Button("Load HDR Environment"))
+		{
+			std::string errorMessage;
+			if (m_Renderer.LoadEnvironmentMap(
+				m_EnvironmentPath.data(), errorMessage))
+				m_SceneStatus = "HDR environment loaded.";
+			else
+				m_SceneStatus = "HDR load failed: " + errorMessage;
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Use Procedural Sky"))
+		{
+			m_Renderer.ClearEnvironmentMap();
+			m_SceneStatus = "Procedural sky enabled.";
+		}
+		float environmentIntensity = m_Renderer.GetEnvironmentIntensity();
+		if (ImGui::SliderFloat(
+			"Environment Intensity", &environmentIntensity, 0.0f, 20.0f))
+			m_Renderer.SetEnvironmentIntensity(environmentIntensity);
+		float environmentRotation = m_Renderer.GetEnvironmentRotation();
+		if (ImGui::SliderFloat(
+			"Environment Rotation", &environmentRotation, -180.0f, 180.0f))
+			m_Renderer.SetEnvironmentRotation(environmentRotation);
+		ImGui::TextWrapped(
+			"HDR pixels become the background and indirect environment light. "
+			"Rotation turns the panorama around the vertical axis.");
 
 		uint32_t sphereCount = m_Renderer.GetSphereCount();
 		ImGui::Text(
@@ -676,6 +713,7 @@ private:
 
 private:
 	std::array<char, 260> m_ObjPath{ "assets/models/Cube.obj" };
+	std::array<char, 260> m_EnvironmentPath{ "assets/environment/Studio.hdr" };
 	ComputeRenderer m_Renderer;
 	float m_CameraMoveSpeed = 3.0f;
 	float m_MouseSensitivity = 0.1f;
