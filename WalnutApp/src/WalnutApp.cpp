@@ -284,8 +284,12 @@ public:
 				0.05f,
 				0.05f,
 				200.0f);
+			const char* colorLabel =
+				sphere.Type == ComputeRenderer::MaterialType::Dielectric
+					? "Transmittance"
+					: "Albedo";
 			sphereChanged |= ImGui::ColorEdit3(
-				"Albedo",
+				colorLabel,
 				&sphere.Albedo.x);
 
 			if (sphere.Type == ComputeRenderer::MaterialType::Legacy)
@@ -326,7 +330,9 @@ public:
 			else
 			{
 				ImGui::TextWrapped(
-					"Dielectric refracts through the surface and reflects more at grazing angles.");
+					"Dielectric refracts through the surface and reflects more at "
+					"grazing angles. Transmittance is the fraction of each colour "
+					"that remains after one world unit inside the glass.");
 				sphereChanged |= ImGui::SliderFloat(
 					"Index of Refraction",
 					&sphere.IndexOfRefraction,

@@ -857,6 +857,20 @@ vec3 TraceRay(
 
 		if (material.Type == MATERIAL_DIELECTRIC)
 		{
+			// A back-face hit means this segment travelled through the glass. Albedo
+			// is interpreted as transmittance per world unit, so Beer-Lambert
+			// absorption naturally makes a longer trip lose more coloured energy.
+			if (!closestHit.FrontFace)
+			{
+				vec3 transmittancePerUnit = clamp(
+					material.Albedo,
+					vec3(0.001),
+					vec3(1.0));
+				throughput *= pow(
+					transmittancePerUnit,
+					vec3(closestHit.Distance));
+			}
+
 			// Entering glass goes from air (1.0) to the material IOR; leaving it
 			// reverses that ratio. The oriented normal always opposes the ray.
 			float refractionRatio = closestHit.FrontFace
@@ -882,9 +896,8 @@ vec3 TraceRay(
 					unitDirection,
 					closestHit.Normal,
 					refractionRatio));
-			// This small model uses albedo as a transmission tint. Offsetting along
-			// the new direction puts an entering ray inside and an exiting ray outside.
-			throughput *= material.Albedo;
+			// Offsetting along the new direction puts an entering ray inside and an
+			// exiting ray outside without assuming which side reflection chose.
 			ray.Origin = closestHit.Position + ray.Direction * RAY_EPSILON;
 			previousBounceWasDiffuse = false;
 			continue;
