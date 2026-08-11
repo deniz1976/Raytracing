@@ -63,7 +63,6 @@ layout(push_constant) uniform PushConstants
 	uvec4 SceneSettings;
 } u_PushConstants;
 
-const int MAX_BOUNCES = 3;
 const float RAY_EPSILON = 0.001;
 const uint MATERIAL_LEGACY = 0u;
 const uint MATERIAL_DIFFUSE = 1u;
@@ -606,7 +605,10 @@ vec3 TraceRay(
 	uint lightCount = u_PushConstants.SceneSettings.y;
 	bool sampleOneLight = u_PushConstants.SceneSettings.z != 0u;
 
-	for (int bounceIndex = 0; bounceIndex < MAX_BOUNCES; bounceIndex++)
+	for (
+		uint bounceIndex = 0u;
+		bounceIndex < u_PushConstants.SceneSettings.w;
+		bounceIndex++)
 	{
 		HitRecord closestHit;
 		bool hitSurface = TraceScene(ray, closestHit);

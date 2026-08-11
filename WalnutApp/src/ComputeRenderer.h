@@ -63,6 +63,8 @@ public:
 	// can still represent.
 	static constexpr float MinExposure = 0.1f;
 	static constexpr float MaxExposure = 4.0f;
+	static constexpr uint32_t MinBounceCount = 1;
+	static constexpr uint32_t MaxBounceCount = 10;
 
 	~ComputeRenderer();
 
@@ -74,6 +76,8 @@ public:
 	const glm::vec3& GetCameraForward() const { return m_CameraForward; }
 	float GetExposure() const { return m_Exposure; }
 	void SetExposure(float exposure);
+	uint32_t GetBounceCount() const { return m_BounceCount; }
+	void SetBounceCount(uint32_t bounceCount);
 	const Sphere& GetSphere(uint32_t index) const;
 	void SetSphere(uint32_t index, const Sphere& sphere);
 	bool AddSphere();
@@ -190,6 +194,7 @@ private:
 	// Owned here rather than in the UI for the same reason the camera is: a scene
 	// load changes it, and a second copy in the UI would go stale.
 	float m_Exposure = 1.0f;
+	uint32_t m_BounceCount = 3;
 	std::vector<Sphere> m_Spheres;
 	std::vector<SphereLight> m_Lights;
 

@@ -135,6 +135,19 @@ public:
 			m_Renderer.SetExposure(exposure);
 		}
 
+		int bounceCount = static_cast<int>(m_Renderer.GetBounceCount());
+		if (ImGui::SliderInt(
+			"Max Bounces",
+			&bounceCount,
+			static_cast<int>(ComputeRenderer::MinBounceCount),
+			static_cast<int>(ComputeRenderer::MaxBounceCount)))
+		{
+			m_Renderer.SetBounceCount(static_cast<uint32_t>(bounceCount));
+		}
+		ImGui::TextWrapped(
+			"More bounces allow longer reflection and refraction paths, but cost "
+			"more GPU work per sample.");
+
 		if (ImGui::Button("Reset Camera"))
 		{
 			camera = ComputeRenderer::Camera{};

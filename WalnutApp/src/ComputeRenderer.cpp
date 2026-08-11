@@ -20,7 +20,7 @@ namespace
 {
 	// SceneSettings.x is 1 when the BVH should be traversed, .y is the number of
 	// lights in the light buffer, .z is 1 when each hit samples a single light
-	// chosen by weight instead of all of them. The last slot is reserved padding.
+	// chosen by weight instead of all of them and .w is the bounce limit.
 	struct alignas(16) PushConstants
 	{
 		glm::vec4 CameraPosition;
@@ -1419,6 +1419,22 @@ void ComputeRenderer::SetExposure(float exposure)
 	m_Exposure = SanitizeExposure(exposure);
 }
 
+// The bounce limit changes how far a sample can travel through reflection and
+// refraction chains, so samples made with the old limit cannot stay in the same
+// progressive average.
+void ComputeRenderer::SetBounceCount(uint32_t bounceCount)
+{
+	const uint32_t sanitizedBounceCount = std::clamp(
+		bounceCount,
+		MinBounceCount,
+		MaxBounceCount);
+	if (m_BounceCount == sanitizedBounceCount)
+		return;
+
+	m_BounceCount = sanitizedBounceCount;
+	ResetAccumulation();
+}
+
 // Turns the two angles the UI edits into the forward vector the shader needs.
 // Yaw turns the camera around the world up axis and pitch tilts it, so this is a
 // spherical to Cartesian conversion. Zero yaw and zero pitch has to come out as
@@ -1805,7 +1821,7 @@ void ComputeRenderer::Render()
 		traverseBvh ? 1u : 0u,
 		GetLightCount(),
 		m_UseStochasticLights ? 1u : 0u,
-		0u);
+		m_BounceCount);
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
