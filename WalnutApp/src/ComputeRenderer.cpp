@@ -902,7 +902,7 @@ void ComputeRenderer::UploadLightBuffer()
 		// of the shading point, so they cannot appear here; this is a bound on
 		// the light rather than its actual contribution.
 		weights[lightIndex] =
-			light.Intensity *
+			light.Intensity * light.Radius * light.Radius *
 			(light.Color.r + light.Color.g + light.Color.b);
 		totalWeight += weights[lightIndex];
 	}

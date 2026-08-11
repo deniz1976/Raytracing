@@ -64,6 +64,7 @@ layout(push_constant) uniform PushConstants
 } u_PushConstants;
 
 const float RAY_EPSILON = 0.001;
+const float PI = 3.14159265359;
 // Let the first few path segments run deterministically, then spend fewer rays
 // on weak paths without changing their expected contribution.
 const uint RUSSIAN_ROULETTE_START_BOUNCE = 3u;
@@ -147,7 +148,7 @@ float SchlickReflectance(float cosine, float indexOfRefraction)
 vec3 RandomUnitVector(inout uint state)
 {
 	float z = NextRandom(state) * 2.0 - 1.0;
-	float angle = NextRandom(state) * 2.0 * 3.14159265359;
+	float angle = NextRandom(state) * 2.0 * PI;
 	float radius = sqrt(max(0.0, 1.0 - z * z));
 
 	return vec3(
@@ -157,20 +158,10 @@ vec3 RandomUnitVector(inout uint state)
 }
 
 // A Lambert surface scatters most strongly near its normal. Sampling that
-// cosine distribution makes the Lambert BRDF and the sampling PDF cancel, so
-// the path throughput only needs to be multiplied by albedo.
-vec3 RandomCosineHemisphere(vec3 normal, inout uint state)
+// cosine distribution follows the integrand and keeps the estimator's variance
+// lower than choosing every hemisphere direction equally often.
+vec3 LocalToWorld(vec3 localDirection, vec3 normal)
 {
-	float firstRandom = NextRandom(state);
-	float secondRandom = NextRandom(state);
-	float angle = 2.0 * 3.14159265359 * firstRandom;
-	float radialDistance = sqrt(secondRandom);
-
-	vec3 localDirection = vec3(
-		cos(angle) * radialDistance,
-		sin(angle) * radialDistance,
-		sqrt(max(0.0, 1.0 - secondRandom)));
-
 	vec3 helperAxis = abs(normal.z) < 0.999
 		? vec3(0.0, 0.0, 1.0)
 		: vec3(1.0, 0.0, 0.0);
@@ -181,6 +172,31 @@ vec3 RandomCosineHemisphere(vec3 normal, inout uint state)
 		tangent * localDirection.x +
 		bitangent * localDirection.y +
 		normal * localDirection.z);
+}
+
+vec3 RandomCosineHemisphere(vec3 normal, inout uint state)
+{
+	float firstRandom = NextRandom(state);
+	float secondRandom = NextRandom(state);
+	float angle = 2.0 * PI * firstRandom;
+	float radialDistance = sqrt(secondRandom);
+
+	vec3 localDirection = vec3(
+		cos(angle) * radialDistance,
+		sin(angle) * radialDistance,
+		sqrt(max(0.0, 1.0 - secondRandom)));
+
+	return LocalToWorld(localDirection, normal);
+}
+
+vec3 EvaluateLambertBrdf(Material material)
+{
+	return material.Albedo / PI;
+}
+
+float LambertPdf(vec3 surfaceNormal, vec3 sampledDirection)
+{
+	return max(dot(surfaceNormal, sampledDirection), 0.0) / PI;
 }
 
 Material GetSphereMaterial(SphereData sphere)
@@ -501,21 +517,21 @@ vec3 CalculateSphereLight(
 	Material material,
 	vec3 surfaceNormal,
 	vec3 directionToLight,
-	float lightDistance,
+	float lightSamplePdf,
 	float lightVisibility)
 {
-	float diffuseStrength =
-		max(dot(surfaceNormal, directionToLight), 0.0) *
-		lightVisibility;
-	float attenuation =
-		light.Intensity /
-		max(lightDistance * lightDistance, 0.01);
+	float surfaceCosine = max(dot(surfaceNormal, directionToLight), 0.0);
+	if (surfaceCosine <= 0.0 || lightSamplePdf <= 0.0)
+		return vec3(0.0);
 
+	vec3 emittedRadiance = light.Color * light.Intensity;
+	vec3 brdf = EvaluateLambertBrdf(material);
 	return
-		material.Albedo *
-		light.Color *
-		diffuseStrength *
-		attenuation;
+		brdf *
+		emittedRadiance *
+		surfaceCosine *
+		lightVisibility /
+		lightSamplePdf;
 }
 
 // Picks one light in proportion to the slice of the total weight it was given on
@@ -569,20 +585,55 @@ vec3 SampleSphereLight(
 	inout uint randomState)
 {
 	SphereLight light = GetSphereLight(lightIndex);
+	vec3 surfaceToCenter = light.Position - hit.Position;
+	float centerDistanceSquared = dot(surfaceToCenter, surfaceToCenter);
+	float radiusSquared = light.Radius * light.Radius;
 
-	vec3 sampledLightPosition =
-		light.Position +
-		RandomUnitVector(randomState) * light.Radius;
+	vec3 directionToLight;
+	float lightSamplePdf;
+	if (centerDistanceSquared <= radiusSquared)
+	{
+		// An overlapping emitter surrounds the shading point and covers the full
+		// sphere of directions. Treat it as two-sided for this edge case.
+		directionToLight = RandomUnitVector(randomState);
+		lightSamplePdf = 1.0 / (4.0 * PI);
+	}
+	else
+	{
+		vec3 directionToCenter =
+			surfaceToCenter / sqrt(centerDistanceSquared);
+		float sinThetaMaxSquared =
+			radiusSquared / centerDistanceSquared;
+		float cosThetaMax = sqrt(max(0.0, 1.0 - sinThetaMaxSquared));
+		float firstRandom = NextRandom(randomState);
+		float secondRandom = NextRandom(randomState);
+		float cosTheta = mix(1.0, cosThetaMax, firstRandom);
+		float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+		float angle = 2.0 * PI * secondRandom;
+		vec3 localDirection = vec3(
+			cos(angle) * sinTheta,
+			sin(angle) * sinTheta,
+			cosTheta);
 
-	vec3 surfaceToLight = sampledLightPosition - hit.Position;
-	float lightDistance = length(surfaceToLight);
+		directionToLight = LocalToWorld(
+			localDirection,
+			directionToCenter);
+		// sin^2/(1+cos) equals 1-cos but avoids losing the small difference
+		// between two nearly equal floats for a tiny, distant light.
+		float solidAngle =
+			2.0 * PI * sinThetaMaxSquared / (1.0 + cosThetaMax);
+		lightSamplePdf = 1.0 / solidAngle;
+	}
 
-	// A light sampled exactly on the surface would divide by zero and poison the
-	// running sum with a NaN.
-	if (lightDistance < RAY_EPSILON)
+	Ray lightRay;
+	lightRay.Origin = hit.Position;
+	lightRay.Direction = directionToLight;
+	float lightDistance = HitSphereGeometry(
+		lightRay,
+		light.Position,
+		light.Radius);
+	if (lightDistance <= 0.0)
 		return vec3(0.0);
-
-	vec3 directionToLight = surfaceToLight / lightDistance;
 
 	bool isInShadow = IsOccluded(
 		hit.Position,
@@ -596,7 +647,7 @@ vec3 SampleSphereLight(
 		hit.SurfaceMaterial,
 		hit.Normal,
 		directionToLight,
-		lightDistance,
+		lightSamplePdf,
 		lightVisibility);
 }
 
@@ -725,13 +776,24 @@ vec3 TraceRay(
 			// Direct light is one part of the answer. The new cosine-weighted ray
 			// carries the other part: light arriving after one or more surface bounces.
 			accumulatedColor += throughput * surfaceColor;
-			throughput *= material.Albedo;
 			ray.Origin =
 				closestHit.Position +
 				closestHit.Normal * RAY_EPSILON;
 			ray.Direction = RandomCosineHemisphere(
 				closestHit.Normal,
 				randomState);
+			float surfaceCosine = max(dot(
+				closestHit.Normal,
+				ray.Direction), 0.0);
+			float directionPdf = LambertPdf(
+				closestHit.Normal,
+				ray.Direction);
+			if (directionPdf <= 0.0)
+				break;
+			throughput *=
+				EvaluateLambertBrdf(material) *
+				surfaceCosine /
+				directionPdf;
 			allowEmitterHit = false;
 			continue;
 		}
