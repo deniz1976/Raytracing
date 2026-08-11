@@ -97,6 +97,7 @@ public:
 	bool RemoveSphere(uint32_t index);
 	bool SaveScene(const std::string& path, std::string& errorMessage) const;
 	bool LoadScene(const std::string& path, std::string& errorMessage);
+	bool LoadObj(const std::string& path, std::string& errorMessage);
 	const SphereLight& GetLight(uint32_t index) const;
 	void SetLight(uint32_t index, const SphereLight& light);
 	bool AddLight();

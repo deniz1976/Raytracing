@@ -6,6 +6,7 @@
 
 #include <glm/gtc/constants.hpp>
 
+#include <array>
 #include <string>
 
 namespace
@@ -20,6 +21,17 @@ public:
 	virtual void OnAttach() override
 	{
 		m_Renderer.Init("assets/shaders/RayTracing.comp.spv", 1600, 900);
+		std::string errorMessage;
+		if (m_Renderer.LoadObj(m_ObjPath.data(), errorMessage))
+		{
+			m_SceneStatus = "OBJ loaded: " +
+				std::to_string(m_Renderer.GetTriangleCount()) +
+				" triangles.";
+		}
+		else
+		{
+			m_SceneStatus = "OBJ load failed: " + errorMessage;
+		}
 	}
 
 	virtual void OnDetach() override
@@ -221,9 +233,31 @@ public:
 
 		uint32_t sphereCount = m_Renderer.GetSphereCount();
 		ImGui::Text(
-			"Triangles: %u / %u (model geometry preview)",
+			"Triangles: %u / %u",
 			m_Renderer.GetTriangleCount(),
 			ComputeRenderer::MaxTriangleCount);
+		ImGui::SetNextItemWidth(300.0f);
+		ImGui::InputText(
+			"OBJ Path",
+			m_ObjPath.data(),
+			m_ObjPath.size());
+		if (ImGui::Button("Load OBJ"))
+		{
+			std::string errorMessage;
+			if (m_Renderer.LoadObj(m_ObjPath.data(), errorMessage))
+			{
+				m_SceneStatus = "OBJ loaded: " +
+					std::to_string(m_Renderer.GetTriangleCount()) +
+					" triangles.";
+			}
+			else
+			{
+				m_SceneStatus = "OBJ load failed: " + errorMessage;
+			}
+		}
+		ImGui::TextWrapped(
+			"OBJ faces replace the current triangle model. Polygon faces are "
+			"triangulated and use a default diffuse material.");
 		ImGui::Text(
 			"Spheres: %u / %u",
 			sphereCount,
@@ -594,6 +628,7 @@ private:
 	}
 
 private:
+	std::array<char, 260> m_ObjPath{ "assets/models/Cube.obj" };
 	ComputeRenderer m_Renderer;
 	float m_CameraMoveSpeed = 3.0f;
 	float m_MouseSensitivity = 0.1f;

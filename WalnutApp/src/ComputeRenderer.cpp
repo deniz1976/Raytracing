@@ -13,7 +13,9 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace
@@ -1035,6 +1037,145 @@ bool ComputeRenderer::RemoveSphere(uint32_t index)
 
 	m_Spheres.erase(m_Spheres.begin() + index);
 	UploadSceneBuffer();
+	ResetAccumulation();
+	return true;
+}
+
+bool ComputeRenderer::LoadObj(
+	const std::string& path,
+	std::string& errorMessage)
+{
+	errorMessage.clear();
+	std::ifstream file(path);
+	if (!file)
+	{
+		errorMessage = "OBJ file could not be opened.";
+		return false;
+	}
+
+	std::vector<glm::vec3> vertices;
+	std::vector<Triangle> loadedTriangles;
+	std::string line;
+	uint32_t lineNumber = 0;
+
+	while (std::getline(file, line))
+	{
+		lineNumber++;
+		std::istringstream lineStream(line);
+		std::string command;
+		lineStream >> command;
+		if (command.empty() || command[0] == '#')
+			continue;
+
+		if (command == "v")
+		{
+			glm::vec3 vertex{};
+			if (!(lineStream >> vertex.x >> vertex.y >> vertex.z) ||
+				!std::isfinite(vertex.x) ||
+				!std::isfinite(vertex.y) ||
+				!std::isfinite(vertex.z))
+			{
+				errorMessage = "Invalid vertex at OBJ line " +
+					std::to_string(lineNumber) + ".";
+				return false;
+			}
+			vertices.push_back(vertex);
+			continue;
+		}
+
+		if (command != "f")
+			continue;
+
+		std::vector<uint32_t> faceIndices;
+		std::string vertexReference;
+		while (lineStream >> vertexReference)
+		{
+			// Texture and normal indices follow the first slash. Geometry only
+			// needs the position index, but accepting the complete token lets the
+			// loader read the common v/vt/vn and v//vn OBJ forms.
+			const size_t slash = vertexReference.find('/');
+			const std::string positionReference =
+				vertexReference.substr(0, slash);
+			int64_t objIndex = 0;
+			try
+			{
+				size_t parsedCharacters = 0;
+				objIndex = std::stoll(positionReference, &parsedCharacters);
+				if (parsedCharacters != positionReference.size())
+					throw std::invalid_argument("trailing characters");
+			}
+			catch (const std::exception&)
+			{
+				errorMessage = "Invalid face index at OBJ line " +
+					std::to_string(lineNumber) + ".";
+				return false;
+			}
+
+			// Positive OBJ indices start at one. Negative indices are relative to
+			// the end of the vertex list, with -1 naming the newest vertex.
+			const int64_t resolvedIndex = objIndex > 0
+				? objIndex - 1
+				: static_cast<int64_t>(vertices.size()) + objIndex;
+			if (objIndex == 0 || resolvedIndex < 0 ||
+				resolvedIndex >= static_cast<int64_t>(vertices.size()))
+			{
+				errorMessage = "Face index is out of range at OBJ line " +
+					std::to_string(lineNumber) + ".";
+				return false;
+			}
+			faceIndices.push_back(static_cast<uint32_t>(resolvedIndex));
+		}
+
+		if (faceIndices.size() < 3)
+		{
+			errorMessage = "Face has fewer than three vertices at OBJ line " +
+				std::to_string(lineNumber) + ".";
+			return false;
+		}
+
+		// A triangle fan turns (0, 1, 2, 3) into (0, 1, 2) and (0, 2, 3).
+		// This is exact for triangles and convex polygon faces.
+		for (size_t corner = 1; corner + 1 < faceIndices.size(); corner++)
+		{
+			if (loadedTriangles.size() >= MaxTriangleCount)
+			{
+				errorMessage = "OBJ exceeds the triangle capacity.";
+				return false;
+			}
+
+			loadedTriangles.push_back({
+				vertices[faceIndices[0]],
+				vertices[faceIndices[corner]],
+				vertices[faceIndices[corner + 1]],
+				{ 0.8f, 0.65f, 0.15f },
+				0.0f,
+				0.5f,
+				MaterialType::Diffuse,
+				1.5f
+			});
+		}
+	}
+
+	if (!file.eof())
+	{
+		errorMessage = "OBJ file could not be read completely.";
+		return false;
+	}
+	if (vertices.empty())
+	{
+		errorMessage = "OBJ contains no vertices.";
+		return false;
+	}
+	if (loadedTriangles.empty())
+	{
+		errorMessage = "OBJ contains no faces.";
+		return false;
+	}
+
+	// Commit only after the whole file passes validation. A malformed model
+	// therefore cannot erase the triangles that are currently being displayed.
+	m_Triangles = std::move(loadedTriangles);
+	UploadTriangleBuffer();
 	ResetAccumulation();
 	return true;
 }
