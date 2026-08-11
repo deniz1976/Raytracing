@@ -331,14 +331,14 @@ public:
 
 		ImGui::End();
 
-		ImGui::Begin("Sphere Light Controls");
-		ImGui::TextWrapped(
-			"Each light is a visible glowing sphere. Radius controls its visible "
-			"size and the softness of its shadows; intensity controls brightness.");
+		// Keep this window name stable because ImGui uses it to restore the saved
+		// docking layout. The controls edit sphere lights even though the window
+		// keeps its original, shorter title.
+		ImGui::Begin("Light Controls");
 
 		uint32_t lightCount = m_Renderer.GetLightCount();
 		ImGui::Text(
-			"Lights: %u / %u",
+			"Sphere Lights: %u / %u",
 			lightCount,
 			ComputeRenderer::MaxLightCount);
 
@@ -365,6 +365,11 @@ public:
 					m_SelectedLightIndex = static_cast<int>(lightCount) - 1;
 			}
 		}
+
+		ImGui::Separator();
+		ImGui::TextWrapped(
+			"Each light is a visible glowing sphere. Radius controls its visible "
+			"size and the softness of its shadows; intensity controls brightness.");
 
 		if (lightCount == 0)
 		{
