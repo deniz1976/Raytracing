@@ -64,9 +64,11 @@ layout(push_constant) uniform PushConstants
 } u_PushConstants;
 
 const float RAY_EPSILON = 0.001;
-// Paths carrying less than one percent in every colour channel can no longer
-// make a useful visible contribution, so avoid another scene traversal for them.
-const float MIN_PATH_THROUGHPUT = 0.01;
+// Let the first few path segments run deterministically, then spend fewer rays
+// on weak paths without changing their expected contribution.
+const uint RUSSIAN_ROULETTE_START_BOUNCE = 3u;
+const float MIN_PATH_SURVIVAL_PROBABILITY = 0.05;
+const float MAX_PATH_SURVIVAL_PROBABILITY = 0.95;
 const uint MATERIAL_LEGACY = 0u;
 const uint MATERIAL_DIFFUSE = 1u;
 const uint MATERIAL_METAL = 2u;
@@ -613,14 +615,24 @@ vec3 TraceRay(
 		bounceIndex < u_PushConstants.SceneSettings.w;
 		bounceIndex++)
 	{
-		// Throughput starts at one and is reduced by every reflective or
-		// transmissive material. Test before tracing the next segment so a path
-		// that has become negligible spends no more BVH or shadow-ray work.
-		float strongestThroughputChannel = max(
-			throughput.r,
-			max(throughput.g, throughput.b));
-		if (strongestThroughputChannel < MIN_PATH_THROUGHPUT)
-			break;
+		// After three guaranteed segments, a weak path survives in proportion to
+		// its strongest colour channel. Dividing survivors by that same probability
+		// exactly compensates for the paths that stop, preserving the mean result.
+		if (bounceIndex >= RUSSIAN_ROULETTE_START_BOUNCE)
+		{
+			float strongestThroughputChannel = max(
+				throughput.r,
+				max(throughput.g, throughput.b));
+			float survivalProbability = clamp(
+				strongestThroughputChannel,
+				MIN_PATH_SURVIVAL_PROBABILITY,
+				MAX_PATH_SURVIVAL_PROBABILITY);
+
+			if (NextRandom(randomState) >= survivalProbability)
+				break;
+
+			throughput /= survivalProbability;
+		}
 
 		HitRecord closestHit;
 		bool hitSurface = TraceScene(ray, closestHit);
