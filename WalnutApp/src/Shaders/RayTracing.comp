@@ -156,6 +156,33 @@ vec3 RandomUnitVector(inout uint state)
 		z);
 }
 
+// A Lambert surface scatters most strongly near its normal. Sampling that
+// cosine distribution makes the Lambert BRDF and the sampling PDF cancel, so
+// the path throughput only needs to be multiplied by albedo.
+vec3 RandomCosineHemisphere(vec3 normal, inout uint state)
+{
+	float firstRandom = NextRandom(state);
+	float secondRandom = NextRandom(state);
+	float angle = 2.0 * 3.14159265359 * firstRandom;
+	float radialDistance = sqrt(secondRandom);
+
+	vec3 localDirection = vec3(
+		cos(angle) * radialDistance,
+		sin(angle) * radialDistance,
+		sqrt(max(0.0, 1.0 - secondRandom)));
+
+	vec3 helperAxis = abs(normal.z) < 0.999
+		? vec3(0.0, 0.0, 1.0)
+		: vec3(1.0, 0.0, 0.0);
+	vec3 tangent = normalize(cross(helperAxis, normal));
+	vec3 bitangent = cross(normal, tangent);
+
+	return normalize(
+		tangent * localDirection.x +
+		bitangent * localDirection.y +
+		normal * localDirection.z);
+}
+
 Material GetSphereMaterial(SphereData sphere)
 {
 	Material material;
@@ -469,14 +496,6 @@ bool TraceSphereLights(
 	return hitAnything;
 }
 
-// The ambient term stands in for light that never arrives directly, so it is a
-// property of the surface and is added exactly once. Adding it inside the light
-// loop would make the scene brighter with every light that is created.
-vec3 CalculateAmbientLight(Material material)
-{
-	return material.Albedo * 0.08;
-}
-
 vec3 CalculateSphereLight(
 	SphereLight light,
 	Material material,
@@ -609,6 +628,10 @@ vec3 TraceRay(
 	uint randomState = randomSeed;
 	uint lightCount = u_PushConstants.SceneSettings.y;
 	bool sampleOneLight = u_PushConstants.SceneSettings.z != 0u;
+	// Primary and specular rays may see an emitter. A diffuse bounce already
+	// estimates direct emitters explicitly, so accepting the same path again
+	// through a lucky BSDF sample would count that lighting twice.
+	bool allowEmitterHit = true;
 
 	for (
 		uint bounceIndex = 0u;
@@ -646,7 +669,8 @@ vec3 TraceRay(
 			closestHit.Distance,
 			lightEmission))
 		{
-			accumulatedColor += throughput * lightEmission;
+			if (allowEmitterHit)
+				accumulatedColor += throughput * lightEmission;
 			break;
 		}
 
@@ -664,8 +688,6 @@ vec3 TraceRay(
 
 		if (usesDiffuseLighting)
 		{
-			surfaceColor = CalculateAmbientLight(material);
-
 			if (sampleOneLight && lightCount > 0u)
 			{
 				// One chosen light stands in for the whole list, so the shadow ray
@@ -700,10 +722,18 @@ vec3 TraceRay(
 
 		if (material.Type == MATERIAL_DIFFUSE)
 		{
-			// Diffuse is intentionally the simplest material: direct and ambient
-			// light are its final answer, so it does not spend another bounce.
+			// Direct light is one part of the answer. The new cosine-weighted ray
+			// carries the other part: light arriving after one or more surface bounces.
 			accumulatedColor += throughput * surfaceColor;
-			break;
+			throughput *= material.Albedo;
+			ray.Origin =
+				closestHit.Position +
+				closestHit.Normal * RAY_EPSILON;
+			ray.Direction = RandomCosineHemisphere(
+				closestHit.Normal,
+				randomState);
+			allowEmitterHit = false;
+			continue;
 		}
 
 		if (material.Type == MATERIAL_DIELECTRIC)
@@ -737,6 +767,7 @@ vec3 TraceRay(
 			// the new direction puts an entering ray inside and an exiting ray outside.
 			throughput *= material.Albedo;
 			ray.Origin = closestHit.Position + ray.Direction * RAY_EPSILON;
+			allowEmitterHit = true;
 			continue;
 		}
 
@@ -773,6 +804,7 @@ vec3 TraceRay(
 			perfectReflection,
 			randomDirection,
 			roughness));
+		allowEmitterHit = true;
 	}
 
 	return accumulatedColor;

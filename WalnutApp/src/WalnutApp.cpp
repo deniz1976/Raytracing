@@ -386,7 +386,9 @@ public:
 
 		if (lightCount == 0)
 		{
-			ImGui::Text("No lights in the scene. Only ambient light remains.");
+			ImGui::TextWrapped(
+				"No sphere lights in the scene. Diffuse surfaces can still receive "
+				"light from the sky through indirect paths.");
 		}
 		else
 		{
