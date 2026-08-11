@@ -1,8 +1,11 @@
 #include "ComputeRenderer.h"
 
 #include "Walnut/Application.h"
+#include "Walnut/Image.h"
 
 #include "backends/imgui_impl_vulkan.h"
+
+#include "../../vendor/stb_image/stb_image.h"
 
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -338,6 +341,12 @@ void ComputeRenderer::Init(const std::string& shaderPath, uint32_t width, uint32
 
 	CreateOutputImages();
 	CreateSceneBuffer();
+	const uint32_t whitePixel = 0xffffffffu;
+	m_TextureImage = std::make_unique<Walnut::Image>(
+		1,
+		1,
+		Walnut::ImageFormat::RGBA,
+		&whitePixel);
 	CreateComputeDescriptors();
 	CreateComputePipeline(shaderPath);
 	CreateTimestampQueryPool();
@@ -1026,7 +1035,7 @@ void ComputeRenderer::UploadTriangleBuffer()
 			triangle.TexCoord1);
 		gpuTriangle.TexCoord2 = glm::vec4(
 			triangle.TexCoord2,
-			0.0f,
+			triangle.UsesImageTexture ? 1.0f : 0.0f,
 			triangle.HasTexCoords ? 1.0f : 0.0f);
 	}
 
@@ -1212,7 +1221,10 @@ bool ComputeRenderer::LoadObj(
 	std::vector<glm::vec3> normals;
 	std::vector<glm::vec2> texCoords;
 	std::unordered_map<std::string, glm::vec3> materialAlbedos;
+	std::unordered_map<std::string, std::filesystem::path> materialTextures;
 	glm::vec3 currentAlbedo{ 0.8f, 0.65f, 0.15f };
+	std::filesystem::path currentTexturePath;
+	std::filesystem::path modelTexturePath;
 	std::vector<Triangle> loadedTriangles;
 	std::string line;
 	uint32_t lineNumber = 0;
@@ -1318,6 +1330,18 @@ bool ComputeRenderer::LoadObj(
 						glm::vec3(0.0f),
 						glm::vec3(1.0f));
 				}
+				else if (materialCommand == "map_Kd" && !materialName.empty())
+				{
+					std::string textureName;
+					std::getline(materialStream >> std::ws, textureName);
+					if (textureName.empty())
+					{
+						errorMessage = "MTL diffuse texture path is empty.";
+						return false;
+					}
+					materialTextures[materialName] =
+						materialPath.parent_path() / textureName;
+				}
 			}
 			if (!materialFile.eof())
 			{
@@ -1343,6 +1367,10 @@ bool ComputeRenderer::LoadObj(
 				return false;
 			}
 			currentAlbedo = material->second;
+			const auto texture = materialTextures.find(materialName);
+			currentTexturePath = texture == materialTextures.end()
+				? std::filesystem::path{}
+				: texture->second;
 			continue;
 		}
 
@@ -1517,6 +1545,19 @@ bool ComputeRenderer::LoadObj(
 				triangle.TexCoord1 = texCoords[faceVertices[corner].TexCoordIndex];
 				triangle.TexCoord2 = texCoords[faceVertices[corner + 1].TexCoordIndex];
 			}
+			triangle.UsesImageTexture =
+				triangle.HasTexCoords && !currentTexturePath.empty();
+			if (triangle.UsesImageTexture)
+			{
+				if (!modelTexturePath.empty() &&
+					modelTexturePath != currentTexturePath)
+				{
+					errorMessage =
+						"OBJ uses more than one diffuse texture; this renderer supports one.";
+					return false;
+				}
+				modelTexturePath = currentTexturePath;
+			}
 			loadedTriangles.push_back(triangle);
 		}
 	}
@@ -1537,10 +1578,43 @@ bool ComputeRenderer::LoadObj(
 		return false;
 	}
 
+	std::unique_ptr<Walnut::Image> loadedTexture;
+	if (!modelTexturePath.empty())
+	{
+		int textureWidth = 0;
+		int textureHeight = 0;
+		int textureChannels = 0;
+		if (!stbi_info(
+			modelTexturePath.string().c_str(),
+			&textureWidth,
+			&textureHeight,
+			&textureChannels) ||
+			textureWidth <= 0 || textureHeight <= 0)
+		{
+			errorMessage = "Diffuse texture could not be decoded: " +
+				modelTexturePath.string();
+			return false;
+		}
+		loadedTexture = std::make_unique<Walnut::Image>(
+			modelTexturePath.string());
+	}
+
 	// Commit only after the whole file passes validation. A malformed model
 	// therefore cannot erase the triangles that are currently being displayed.
 	m_ModelTriangles = std::move(loadedTriangles);
 	m_ModelPath = path;
+	if (loadedTexture)
+		m_TextureImage = std::move(loadedTexture);
+	else
+	{
+		const uint32_t whitePixel = 0xffffffffu;
+		m_TextureImage = std::make_unique<Walnut::Image>(
+			1,
+			1,
+			Walnut::ImageFormat::RGBA,
+			&whitePixel);
+	}
+	UpdateTextureDescriptor();
 	ApplyModelTransform();
 	return true;
 }
@@ -2387,7 +2461,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 {
 	VkDevice device = Walnut::Application::GetDevice();
 
-	VkDescriptorSetLayoutBinding descriptorBindings[7]{};
+	VkDescriptorSetLayoutBinding descriptorBindings[8]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorBindings[bindingIndex].binding = bindingIndex;
@@ -2402,24 +2476,31 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorBindings[bindingIndex].descriptorCount = 1;
 		descriptorBindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 	}
+	descriptorBindings[7].binding = 7;
+	descriptorBindings[7].descriptorType =
+		VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	descriptorBindings[7].descriptorCount = 1;
+	descriptorBindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 7;
+	layoutInfo.bindingCount = 8;
 	layoutInfo.pBindings = descriptorBindings;
 	check_vk_result(vkCreateDescriptorSetLayout(
 		device, &layoutInfo, nullptr, &m_ComputeDescriptorSetLayout));
 
-	VkDescriptorPoolSize poolSizes[2]{};
+	VkDescriptorPoolSize poolSizes[3]{};
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	poolSizes[0].descriptorCount = 2;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	poolSizes[1].descriptorCount = 5;
+	poolSizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	poolSizes[2].descriptorCount = 1;
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.maxSets = 1;
-	poolInfo.poolSizeCount = 2;
+	poolInfo.poolSizeCount = 3;
 	poolInfo.pPoolSizes = poolSizes;
 	check_vk_result(vkCreateDescriptorPool(
 		device, &poolInfo, nullptr, &m_ComputeDescriptorPool));
@@ -2474,6 +2555,32 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorWrites[bindingIndex].pBufferInfo = &descriptorBuffers[bindingIndex - 2];
 	}
 	vkUpdateDescriptorSets(device, 7, descriptorWrites, 0, nullptr);
+	UpdateTextureDescriptor();
+}
+
+void ComputeRenderer::UpdateTextureDescriptor()
+{
+	if (m_ComputeDescriptorSet == VK_NULL_HANDLE || !m_TextureImage)
+		return;
+
+	VkDescriptorImageInfo textureInfo{};
+	textureInfo.sampler = m_TextureImage->GetSampler();
+	textureInfo.imageView = m_TextureImage->GetImageView();
+	textureInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	VkWriteDescriptorSet textureWrite{};
+	textureWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	textureWrite.dstSet = m_ComputeDescriptorSet;
+	textureWrite.dstBinding = 7;
+	textureWrite.descriptorCount = 1;
+	textureWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	textureWrite.pImageInfo = &textureInfo;
+	vkUpdateDescriptorSets(
+		Walnut::Application::GetDevice(),
+		1,
+		&textureWrite,
+		0,
+		nullptr);
 }
 
 void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)

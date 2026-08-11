@@ -78,6 +78,8 @@ layout(std430, set = 0, binding = 6) readonly buffer TriangleBvhBuffer
 	BvhNodeData Nodes[];
 } u_TriangleBvhBuffer;
 
+layout(set = 0, binding = 7) uniform sampler2D u_ModelTexture;
+
 layout(push_constant) uniform PushConstants
 {
 	vec4 CameraPosition;
@@ -495,11 +497,23 @@ float HitTriangle(
 			texCoord0 * barycentricW +
 			texCoord1 * barycentricU +
 			texCoord2 * barycentricV;
-		ivec2 checkerCell = ivec2(floor(texCoord * 8.0));
-		bool lightCell = ((checkerCell.x + checkerCell.y) & 1) == 0;
-		textureTint = lightCell
-			? vec3(1.0)
-			: vec3(0.18);
+		if (triangle.TexCoord2.z > 0.5)
+		{
+			// stb_image's row zero is the top of the image while OBJ convention
+			// normally treats V=0 as the bottom, so V is flipped at sampling time.
+			vec3 encodedColor = texture(
+				u_ModelTexture,
+				vec2(texCoord.x, 1.0 - texCoord.y)).rgb;
+			textureTint = pow(encodedColor, vec3(2.2));
+		}
+		else
+		{
+			ivec2 checkerCell = ivec2(floor(texCoord * 8.0));
+			bool lightCell = ((checkerCell.x + checkerCell.y) & 1) == 0;
+			textureTint = lightCell
+				? vec3(1.0)
+				: vec3(0.18);
+		}
 	}
 	return hitDistance;
 }

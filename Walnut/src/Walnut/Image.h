@@ -23,6 +23,8 @@ namespace Walnut {
 		void SetData(const void* data);
 
 		VkDescriptorSet GetDescriptorSet() const { return m_DescriptorSet; }
+		VkImageView GetImageView() const { return m_ImageView; }
+		VkSampler GetSampler() const { return m_Sampler; }
 
 		void Resize(uint32_t width, uint32_t height);
 

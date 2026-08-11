@@ -1,11 +1,14 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include <glm/glm.hpp>
 #include <vulkan/vulkan.h>
+
+#include "Walnut/Image.h"
 
 class ComputeRenderer
 {
@@ -55,6 +58,7 @@ public:
 		glm::vec2 TexCoord1{ 0.0f };
 		glm::vec2 TexCoord2{ 0.0f };
 		bool HasTexCoords = false;
+		bool UsesImageTexture = false;
 	};
 
 	struct ModelTransform
@@ -217,6 +221,7 @@ private:
 		uint32_t& leftCount);
 	void BuildBvh();
 	void CreateComputeDescriptors();
+	void UpdateTextureDescriptor();
 	void CreateComputePipeline(const std::string& shaderPath);
 	void CreateTimestampQueryPool();
 	void ReadGpuComputeTime();
@@ -240,6 +245,7 @@ private:
 	std::vector<Triangle> m_Triangles;
 	std::vector<Triangle> m_ModelTriangles;
 	std::string m_ModelPath;
+	std::unique_ptr<Walnut::Image> m_TextureImage;
 	ModelTransform m_ModelTransform;
 	std::vector<uint32_t> m_TriangleOrder;
 	uint32_t m_TriangleBvhNodeCount = 0;

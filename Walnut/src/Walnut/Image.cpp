@@ -268,7 +268,12 @@ namespace Walnut {
 			use_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 			use_barrier.subresourceRange.levelCount = 1;
 			use_barrier.subresourceRange.layerCount = 1;
-			vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &use_barrier);
+			vkCmdPipelineBarrier(
+				command_buffer,
+				VK_PIPELINE_STAGE_TRANSFER_BIT,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				0, 0, NULL, 0, NULL, 1, &use_barrier);
 
 			Application::FlushCommandBuffer(command_buffer);
 		}
