@@ -64,6 +64,9 @@ layout(push_constant) uniform PushConstants
 } u_PushConstants;
 
 const float RAY_EPSILON = 0.001;
+// Paths carrying less than one percent in every colour channel can no longer
+// make a useful visible contribution, so avoid another scene traversal for them.
+const float MIN_PATH_THROUGHPUT = 0.01;
 const uint MATERIAL_LEGACY = 0u;
 const uint MATERIAL_DIFFUSE = 1u;
 const uint MATERIAL_METAL = 2u;
@@ -610,6 +613,15 @@ vec3 TraceRay(
 		bounceIndex < u_PushConstants.SceneSettings.w;
 		bounceIndex++)
 	{
+		// Throughput starts at one and is reduced by every reflective or
+		// transmissive material. Test before tracing the next segment so a path
+		// that has become negligible spends no more BVH or shadow-ray work.
+		float strongestThroughputChannel = max(
+			throughput.r,
+			max(throughput.g, throughput.b));
+		if (strongestThroughputChannel < MIN_PATH_THROUGHPUT)
+			break;
+
 		HitRecord closestHit;
 		bool hitSurface = TraceScene(ray, closestHit);
 		vec3 lightEmission;
