@@ -63,6 +63,9 @@ struct TriangleData
 	vec4 Normal0;
 	vec4 Normal1;
 	vec4 Normal2;
+	vec4 TexCoord01;
+	// TexCoord2.w is one when all three corners have UV coordinates.
+	vec4 TexCoord2;
 };
 
 layout(std430, set = 0, binding = 5) readonly buffer TriangleBuffer
@@ -429,7 +432,8 @@ float HitTriangle(
 	Ray ray,
 	TriangleData triangle,
 	out vec3 geometricNormal,
-	out vec3 shadingNormal)
+	out vec3 shadingNormal,
+	out vec3 textureTint)
 {
 	vec3 vertex0 = triangle.Vertex0.xyz;
 	vec3 edge1 = triangle.Vertex1.xyz - vertex0;
@@ -438,6 +442,7 @@ float HitTriangle(
 	float determinant = dot(edge1, directionCrossEdge2);
 	geometricNormal = vec3(0.0);
 	shadingNormal = vec3(0.0);
+	textureTint = vec3(1.0);
 	if (abs(determinant) < 1e-8)
 		return -1.0;
 
@@ -480,6 +485,22 @@ float HitTriangle(
 				shadingNormal = -shadingNormal;
 		}
 	}
+	if (triangle.TexCoord2.w > 0.5)
+	{
+		float barycentricW = 1.0 - barycentricU - barycentricV;
+		vec2 texCoord0 = triangle.TexCoord01.xy;
+		vec2 texCoord1 = triangle.TexCoord01.zw;
+		vec2 texCoord2 = triangle.TexCoord2.xy;
+		vec2 texCoord =
+			texCoord0 * barycentricW +
+			texCoord1 * barycentricU +
+			texCoord2 * barycentricV;
+		ivec2 checkerCell = ivec2(floor(texCoord * 8.0));
+		bool lightCell = ((checkerCell.x + checkerCell.y) & 1) == 0;
+		textureTint = lightCell
+			? vec3(1.0)
+			: vec3(0.18);
+	}
 	return hitDistance;
 }
 
@@ -496,11 +517,13 @@ bool IntersectTriangleRange(
 			u_TriangleBuffer.Triangles[firstTriangle + offset];
 		vec3 geometricNormal;
 		vec3 shadingNormal;
+		vec3 textureTint;
 		float hitDistance = HitTriangle(
 			ray,
 			triangle,
 			geometricNormal,
-			shadingNormal);
+			shadingNormal,
+			textureTint);
 		if (hitDistance > 0.0 && hitDistance < closestHit.Distance)
 		{
 			hitAnything = true;
@@ -511,6 +534,7 @@ bool IntersectTriangleRange(
 				? shadingNormal
 				: -shadingNormal;
 			closestHit.SurfaceMaterial = GetTriangleMaterial(triangle);
+			closestHit.SurfaceMaterial.Albedo *= textureTint;
 		}
 	}
 	return hitAnything;
@@ -739,11 +763,13 @@ bool IsOccluded(
 		{
 			vec3 geometricNormal;
 			vec3 shadingNormal;
+			vec3 textureTint;
 			float hitDistance = HitTriangle(
 				shadowRay,
 				u_TriangleBuffer.Triangles[triangleIndex],
 				geometricNormal,
-				shadingNormal);
+				shadingNormal,
+				textureTint);
 			if (hitDistance > 0.0 &&
 				hitDistance < maximumDistance - RAY_EPSILON)
 			{
@@ -778,11 +804,13 @@ bool IsOccluded(
 				{
 					vec3 geometricNormal;
 					vec3 shadingNormal;
+					vec3 textureTint;
 					float hitDistance = HitTriangle(
 						shadowRay,
 						u_TriangleBuffer.Triangles[node.Links.x + offset],
 						geometricNormal,
-						shadingNormal);
+						shadingNormal,
+						textureTint);
 					if (hitDistance > 0.0 &&
 						hitDistance < maximumDistance - RAY_EPSILON)
 					{

@@ -18,6 +18,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -65,9 +66,12 @@ namespace
 		glm::vec4 Normal0;
 		glm::vec4 Normal1;
 		glm::vec4 Normal2;
+		// TexCoord2.w is one when all three OBJ corners have UV coordinates.
+		glm::vec4 TexCoord01;
+		glm::vec4 TexCoord2;
 	};
 
-	static_assert(sizeof(GpuTriangle) == 128);
+	static_assert(sizeof(GpuTriangle) == 160);
 
 	// One node of the bounding volume hierarchy. An interior node stores the two
 	// child indices and a SphereCount of zero; a leaf stores the first sphere in
@@ -994,7 +998,7 @@ void ComputeRenderer::UploadTriangleBuffer()
 {
 	BuildTriangleBvh();
 
-	std::array<GpuTriangle, MaxTriangleCount> gpuTriangles{};
+	std::vector<GpuTriangle> gpuTriangles(MaxTriangleCount);
 	for (size_t triangleIndex = 0;
 		triangleIndex < m_Triangles.size();
 		triangleIndex++)
@@ -1017,12 +1021,19 @@ void ComputeRenderer::UploadTriangleBuffer()
 			triangle.HasVertexNormals ? 1.0f : 0.0f);
 		gpuTriangle.Normal1 = glm::vec4(triangle.Normal1, 0.0f);
 		gpuTriangle.Normal2 = glm::vec4(triangle.Normal2, 0.0f);
+		gpuTriangle.TexCoord01 = glm::vec4(
+			triangle.TexCoord0,
+			triangle.TexCoord1);
+		gpuTriangle.TexCoord2 = glm::vec4(
+			triangle.TexCoord2,
+			0.0f,
+			triangle.HasTexCoords ? 1.0f : 0.0f);
 	}
 
 	WriteHostBuffer(
 		m_TriangleBufferMemory,
 		gpuTriangles.data(),
-		sizeof(gpuTriangles));
+		gpuTriangles.size() * sizeof(GpuTriangle));
 }
 
 void ComputeRenderer::BuildTriangleBvh()
@@ -1038,13 +1049,13 @@ void ComputeRenderer::BuildTriangleBvh()
 
 	m_TriangleBvhNodeCount = 0;
 	m_TriangleBvhDepth = 0;
-	std::array<GpuBvhNode, MaxTriangleBvhNodeCount> nodes{};
+	std::vector<GpuBvhNode> nodes(MaxTriangleBvhNodeCount);
 	if (triangleCount == 0)
 	{
 		WriteHostBuffer(
 			m_TriangleBvhBufferMemory,
 			nodes.data(),
-			sizeof(nodes));
+			nodes.size() * sizeof(GpuBvhNode));
 		return;
 	}
 
@@ -1140,7 +1151,7 @@ void ComputeRenderer::BuildTriangleBvh()
 	WriteHostBuffer(
 		m_TriangleBvhBufferMemory,
 		nodes.data(),
-		sizeof(nodes));
+		nodes.size() * sizeof(GpuBvhNode));
 }
 
 const ComputeRenderer::Sphere& ComputeRenderer::GetSphere(uint32_t index) const
@@ -1199,6 +1210,9 @@ bool ComputeRenderer::LoadObj(
 
 	std::vector<glm::vec3> vertices;
 	std::vector<glm::vec3> normals;
+	std::vector<glm::vec2> texCoords;
+	std::unordered_map<std::string, glm::vec3> materialAlbedos;
+	glm::vec3 currentAlbedo{ 0.8f, 0.65f, 0.15f };
 	std::vector<Triangle> loadedTriangles;
 	std::string line;
 	uint32_t lineNumber = 0;
@@ -1243,6 +1257,94 @@ bool ComputeRenderer::LoadObj(
 			normals.push_back(glm::normalize(normal));
 			continue;
 		}
+		if (command == "vt")
+		{
+			glm::vec2 texCoord{};
+			if (!(lineStream >> texCoord.x >> texCoord.y) ||
+				!std::isfinite(texCoord.x) ||
+				!std::isfinite(texCoord.y))
+			{
+				errorMessage = "Invalid texture coordinate at OBJ line " +
+					std::to_string(lineNumber) + ".";
+				return false;
+			}
+			texCoords.push_back(texCoord);
+			continue;
+		}
+		if (command == "mtllib")
+		{
+			std::string libraryName;
+			if (!(lineStream >> libraryName))
+			{
+				errorMessage = "Material library is missing at OBJ line " +
+					std::to_string(lineNumber) + ".";
+				return false;
+			}
+
+			const std::filesystem::path materialPath =
+				std::filesystem::path(path).parent_path() / libraryName;
+			std::ifstream materialFile(materialPath);
+			if (!materialFile)
+			{
+				errorMessage = "MTL file could not be opened: " +
+					materialPath.string();
+				return false;
+			}
+
+			std::string materialLine;
+			std::string materialName;
+			while (std::getline(materialFile, materialLine))
+			{
+				std::istringstream materialStream(materialLine);
+				std::string materialCommand;
+				materialStream >> materialCommand;
+				if (materialCommand == "newmtl")
+				{
+					materialStream >> materialName;
+				}
+				else if (materialCommand == "Kd" && !materialName.empty())
+				{
+					glm::vec3 albedo{};
+					if (!(materialStream >> albedo.r >> albedo.g >> albedo.b) ||
+						!std::isfinite(albedo.r) ||
+						!std::isfinite(albedo.g) ||
+						!std::isfinite(albedo.b))
+					{
+						errorMessage = "MTL diffuse color is invalid.";
+						return false;
+					}
+					materialAlbedos[materialName] = glm::clamp(
+						albedo,
+						glm::vec3(0.0f),
+						glm::vec3(1.0f));
+				}
+			}
+			if (!materialFile.eof())
+			{
+				errorMessage = "MTL file could not be read completely.";
+				return false;
+			}
+			continue;
+		}
+		if (command == "usemtl")
+		{
+			std::string materialName;
+			if (!(lineStream >> materialName))
+			{
+				errorMessage = "Material name is missing at OBJ line " +
+					std::to_string(lineNumber) + ".";
+				return false;
+			}
+			const auto material = materialAlbedos.find(materialName);
+			if (material == materialAlbedos.end())
+			{
+				errorMessage = "OBJ references an unknown material at line " +
+					std::to_string(lineNumber) + ".";
+				return false;
+			}
+			currentAlbedo = material->second;
+			continue;
+		}
 
 		if (command != "f")
 			continue;
@@ -1250,6 +1352,7 @@ bool ComputeRenderer::LoadObj(
 		struct FaceVertex
 		{
 			uint32_t PositionIndex = 0;
+			int64_t TexCoordIndex = -1;
 			int64_t NormalIndex = -1;
 		};
 		std::vector<FaceVertex> faceVertices;
@@ -1292,6 +1395,44 @@ bool ComputeRenderer::LoadObj(
 
 			FaceVertex faceVertex;
 			faceVertex.PositionIndex = static_cast<uint32_t>(resolvedIndex);
+			if (firstSlash != std::string::npos &&
+				firstSlash + 1 < vertexReference.size() &&
+				(firstSlash + 1 != secondSlash))
+			{
+				const size_t textureLength = secondSlash == std::string::npos
+					? std::string::npos
+					: secondSlash - firstSlash - 1;
+				const std::string textureReference = vertexReference.substr(
+					firstSlash + 1,
+					textureLength);
+				int64_t textureObjIndex = 0;
+				try
+				{
+					size_t parsedCharacters = 0;
+					textureObjIndex = std::stoll(
+						textureReference,
+						&parsedCharacters);
+					if (parsedCharacters != textureReference.size())
+						throw std::invalid_argument("trailing characters");
+				}
+				catch (const std::exception&)
+				{
+					errorMessage = "Invalid texture index at OBJ line " +
+						std::to_string(lineNumber) + ".";
+					return false;
+				}
+				const int64_t resolvedTextureIndex = textureObjIndex > 0
+					? textureObjIndex - 1
+					: static_cast<int64_t>(texCoords.size()) + textureObjIndex;
+				if (textureObjIndex == 0 || resolvedTextureIndex < 0 ||
+					resolvedTextureIndex >= static_cast<int64_t>(texCoords.size()))
+				{
+					errorMessage = "Texture index is out of range at OBJ line " +
+						std::to_string(lineNumber) + ".";
+					return false;
+				}
+				faceVertex.TexCoordIndex = resolvedTextureIndex;
+			}
 			if (secondSlash != std::string::npos &&
 				secondSlash + 1 < vertexReference.size())
 			{
@@ -1350,7 +1491,7 @@ bool ComputeRenderer::LoadObj(
 				vertices[faceVertices[0].PositionIndex],
 				vertices[faceVertices[corner].PositionIndex],
 				vertices[faceVertices[corner + 1].PositionIndex],
-				{ 0.8f, 0.65f, 0.15f },
+				currentAlbedo,
 				0.0f,
 				0.5f,
 				MaterialType::Diffuse,
@@ -1365,6 +1506,16 @@ bool ComputeRenderer::LoadObj(
 				triangle.Normal0 = normals[faceVertices[0].NormalIndex];
 				triangle.Normal1 = normals[faceVertices[corner].NormalIndex];
 				triangle.Normal2 = normals[faceVertices[corner + 1].NormalIndex];
+			}
+			triangle.HasTexCoords =
+				faceVertices[0].TexCoordIndex >= 0 &&
+				faceVertices[corner].TexCoordIndex >= 0 &&
+				faceVertices[corner + 1].TexCoordIndex >= 0;
+			if (triangle.HasTexCoords)
+			{
+				triangle.TexCoord0 = texCoords[faceVertices[0].TexCoordIndex];
+				triangle.TexCoord1 = texCoords[faceVertices[corner].TexCoordIndex];
+				triangle.TexCoord2 = texCoords[faceVertices[corner + 1].TexCoordIndex];
 			}
 			loadedTriangles.push_back(triangle);
 		}

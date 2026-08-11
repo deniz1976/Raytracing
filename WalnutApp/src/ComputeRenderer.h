@@ -51,6 +51,10 @@ public:
 		glm::vec3 Normal1{ 0.0f };
 		glm::vec3 Normal2{ 0.0f };
 		bool HasVertexNormals = false;
+		glm::vec2 TexCoord0{ 0.0f };
+		glm::vec2 TexCoord1{ 0.0f };
+		glm::vec2 TexCoord2{ 0.0f };
+		bool HasTexCoords = false;
 	};
 
 	struct ModelTransform
