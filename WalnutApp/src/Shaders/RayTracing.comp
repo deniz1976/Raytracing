@@ -1158,14 +1158,32 @@ vec3 GetSkyColor(vec3 rayDirection)
 		u_PushConstants.EnvironmentIntensity;
 }
 
-vec3 ToneMapReinhard(vec3 hdrColor)
+vec3 ToneMapAces(vec3 hdrColor)
 {
-	return hdrColor / (vec3(1.0) + hdrColor);
+	// This compact ACES filmic fit keeps bright HDR highlights from turning into
+	// flat white as abruptly as a simple channel-by-channel compression.
+	const float a = 2.51;
+	const float b = 0.03;
+	const float c = 2.43;
+	const float d = 0.59;
+	const float e = 0.14;
+	return clamp(
+		(hdrColor * (a * hdrColor + b)) /
+		(hdrColor * (c * hdrColor + d) + e),
+		vec3(0.0),
+		vec3(1.0));
 }
 
-vec3 ApplyGammaCorrection(vec3 linearColor)
+vec3 LinearToSrgb(vec3 linearColor)
 {
-	return pow(max(linearColor, vec3(0.0)), vec3(1.0 / 2.2));
+	vec3 safeColor = max(linearColor, vec3(0.0));
+	vec3 lowRange = 12.92 * safeColor;
+	vec3 highRange =
+		1.055 * pow(safeColor, vec3(1.0 / 2.4)) - 0.055;
+	return mix(
+		highRange,
+		lowRange,
+		lessThanEqual(safeColor, vec3(0.0031308)));
 }
 
 vec3 TraceRay(
@@ -1494,6 +1512,12 @@ void main()
 
 	uint pathSeed = frameSeed ^ 0xa511e9b3u;
 	vec3 sampleColor = TraceRay(ray, pathSeed);
+	// One invalid floating-point path must not poison this pixel forever because
+	// every later frame reads the previous accumulation before adding its sample.
+	if (any(isnan(sampleColor)) || any(isinf(sampleColor)))
+		sampleColor = vec3(0.0);
+	else
+		sampleColor = max(sampleColor, vec3(0.0));
 	vec3 previousAccumulation =
 		u_PushConstants.FrameIndex > 1
 			? imageLoad(u_AccumulationImage, pixel).rgb
@@ -1510,7 +1534,7 @@ void main()
 		float(u_PushConstants.FrameIndex);
 
 	vec3 exposedColor = averageColor * u_PushConstants.Exposure;
-	vec3 toneMappedColor = ToneMapReinhard(exposedColor);
-	vec3 displayColor = ApplyGammaCorrection(toneMappedColor);
+	vec3 toneMappedColor = ToneMapAces(exposedColor);
+	vec3 displayColor = LinearToSrgb(toneMappedColor);
 	imageStore(u_OutputImage, pixel, vec4(displayColor, 1.0));
 }

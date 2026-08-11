@@ -155,6 +155,9 @@ public:
 		{
 			m_Renderer.SetExposure(exposure);
 		}
+		ImGui::TextWrapped(
+			"Exposure scales linear HDR light before ACES tone mapping converts "
+			"it to the display range.");
 
 		int bounceCount = static_cast<int>(m_Renderer.GetBounceCount());
 		if (ImGui::SliderInt(
