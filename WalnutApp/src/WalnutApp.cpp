@@ -269,7 +269,8 @@ public:
 		}
 		ImGui::TextWrapped(
 			"OBJ faces replace the current triangle model. Polygon faces are "
-			"triangulated and use a default diffuse material.");
+			"triangulated and use a default diffuse material. Vertex normals "
+			"enable smooth shading when the OBJ provides them.");
 
 		ComputeRenderer::ModelTransform modelTransform =
 			m_Renderer.GetModelTransform();

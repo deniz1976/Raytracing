@@ -47,6 +47,10 @@ public:
 		float Roughness;
 		MaterialType Type = MaterialType::Diffuse;
 		float IndexOfRefraction = 1.5f;
+		glm::vec3 Normal0{ 0.0f };
+		glm::vec3 Normal1{ 0.0f };
+		glm::vec3 Normal2{ 0.0f };
+		bool HasVertexNormals = false;
 	};
 
 	struct ModelTransform

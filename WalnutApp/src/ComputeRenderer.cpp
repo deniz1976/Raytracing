@@ -61,9 +61,13 @@ namespace
 		glm::vec4 Vertex2;
 		glm::vec4 AlbedoReflectivity;
 		glm::vec4 RoughnessMaterial;
+		// Normal0.w is one when all three OBJ corner normals are available.
+		glm::vec4 Normal0;
+		glm::vec4 Normal1;
+		glm::vec4 Normal2;
 	};
 
-	static_assert(sizeof(GpuTriangle) == 80);
+	static_assert(sizeof(GpuTriangle) == 128);
 
 	// One node of the bounding volume hierarchy. An interior node stores the two
 	// child indices and a SphereCount of zero; a leaf stores the first sphere in
@@ -1008,6 +1012,11 @@ void ComputeRenderer::UploadTriangleBuffer()
 			static_cast<float>(triangle.Type),
 			triangle.IndexOfRefraction,
 			0.0f);
+		gpuTriangle.Normal0 = glm::vec4(
+			triangle.Normal0,
+			triangle.HasVertexNormals ? 1.0f : 0.0f);
+		gpuTriangle.Normal1 = glm::vec4(triangle.Normal1, 0.0f);
+		gpuTriangle.Normal2 = glm::vec4(triangle.Normal2, 0.0f);
 	}
 
 	WriteHostBuffer(
@@ -1189,6 +1198,7 @@ bool ComputeRenderer::LoadObj(
 	}
 
 	std::vector<glm::vec3> vertices;
+	std::vector<glm::vec3> normals;
 	std::vector<Triangle> loadedTriangles;
 	std::string line;
 	uint32_t lineNumber = 0;
@@ -1217,20 +1227,41 @@ bool ComputeRenderer::LoadObj(
 			vertices.push_back(vertex);
 			continue;
 		}
+		if (command == "vn")
+		{
+			glm::vec3 normal{};
+			if (!(lineStream >> normal.x >> normal.y >> normal.z) ||
+				!std::isfinite(normal.x) ||
+				!std::isfinite(normal.y) ||
+				!std::isfinite(normal.z) ||
+				glm::dot(normal, normal) <= 1e-12f)
+			{
+				errorMessage = "Invalid normal at OBJ line " +
+					std::to_string(lineNumber) + ".";
+				return false;
+			}
+			normals.push_back(glm::normalize(normal));
+			continue;
+		}
 
 		if (command != "f")
 			continue;
 
-		std::vector<uint32_t> faceIndices;
+		struct FaceVertex
+		{
+			uint32_t PositionIndex = 0;
+			int64_t NormalIndex = -1;
+		};
+		std::vector<FaceVertex> faceVertices;
 		std::string vertexReference;
 		while (lineStream >> vertexReference)
 		{
-			// Texture and normal indices follow the first slash. Geometry only
-			// needs the position index, but accepting the complete token lets the
-			// loader read the common v/vt/vn and v//vn OBJ forms.
-			const size_t slash = vertexReference.find('/');
+			const size_t firstSlash = vertexReference.find('/');
+			const size_t secondSlash = firstSlash == std::string::npos
+				? std::string::npos
+				: vertexReference.find('/', firstSlash + 1);
 			const std::string positionReference =
-				vertexReference.substr(0, slash);
+				vertexReference.substr(0, firstSlash);
 			int64_t objIndex = 0;
 			try
 			{
@@ -1258,10 +1289,47 @@ bool ComputeRenderer::LoadObj(
 					std::to_string(lineNumber) + ".";
 				return false;
 			}
-			faceIndices.push_back(static_cast<uint32_t>(resolvedIndex));
+
+			FaceVertex faceVertex;
+			faceVertex.PositionIndex = static_cast<uint32_t>(resolvedIndex);
+			if (secondSlash != std::string::npos &&
+				secondSlash + 1 < vertexReference.size())
+			{
+				const std::string normalReference =
+					vertexReference.substr(secondSlash + 1);
+				int64_t normalObjIndex = 0;
+				try
+				{
+					size_t parsedCharacters = 0;
+					normalObjIndex = std::stoll(
+						normalReference,
+						&parsedCharacters);
+					if (parsedCharacters != normalReference.size())
+						throw std::invalid_argument("trailing characters");
+				}
+				catch (const std::exception&)
+				{
+					errorMessage = "Invalid normal index at OBJ line " +
+						std::to_string(lineNumber) + ".";
+					return false;
+				}
+
+				const int64_t resolvedNormalIndex = normalObjIndex > 0
+					? normalObjIndex - 1
+					: static_cast<int64_t>(normals.size()) + normalObjIndex;
+				if (normalObjIndex == 0 || resolvedNormalIndex < 0 ||
+					resolvedNormalIndex >= static_cast<int64_t>(normals.size()))
+				{
+					errorMessage = "Normal index is out of range at OBJ line " +
+						std::to_string(lineNumber) + ".";
+					return false;
+				}
+				faceVertex.NormalIndex = resolvedNormalIndex;
+			}
+			faceVertices.push_back(faceVertex);
 		}
 
-		if (faceIndices.size() < 3)
+		if (faceVertices.size() < 3)
 		{
 			errorMessage = "Face has fewer than three vertices at OBJ line " +
 				std::to_string(lineNumber) + ".";
@@ -1270,7 +1338,7 @@ bool ComputeRenderer::LoadObj(
 
 		// A triangle fan turns (0, 1, 2, 3) into (0, 1, 2) and (0, 2, 3).
 		// This is exact for triangles and convex polygon faces.
-		for (size_t corner = 1; corner + 1 < faceIndices.size(); corner++)
+		for (size_t corner = 1; corner + 1 < faceVertices.size(); corner++)
 		{
 			if (loadedTriangles.size() >= MaxTriangleCount)
 			{
@@ -1278,16 +1346,27 @@ bool ComputeRenderer::LoadObj(
 				return false;
 			}
 
-			loadedTriangles.push_back({
-				vertices[faceIndices[0]],
-				vertices[faceIndices[corner]],
-				vertices[faceIndices[corner + 1]],
+			Triangle triangle{
+				vertices[faceVertices[0].PositionIndex],
+				vertices[faceVertices[corner].PositionIndex],
+				vertices[faceVertices[corner + 1].PositionIndex],
 				{ 0.8f, 0.65f, 0.15f },
 				0.0f,
 				0.5f,
 				MaterialType::Diffuse,
 				1.5f
-			});
+			};
+			triangle.HasVertexNormals =
+				faceVertices[0].NormalIndex >= 0 &&
+				faceVertices[corner].NormalIndex >= 0 &&
+				faceVertices[corner + 1].NormalIndex >= 0;
+			if (triangle.HasVertexNormals)
+			{
+				triangle.Normal0 = normals[faceVertices[0].NormalIndex];
+				triangle.Normal1 = normals[faceVertices[corner].NormalIndex];
+				triangle.Normal2 = normals[faceVertices[corner + 1].NormalIndex];
+			}
+			loadedTriangles.push_back(triangle);
 		}
 	}
 
@@ -1369,6 +1448,7 @@ void ComputeRenderer::ApplyModelTransform()
 		glm::radians(m_ModelTransform.Rotation.x),
 		{ 1.0f, 0.0f, 0.0f });
 	transform = glm::scale(transform, m_ModelTransform.Scale);
+	const glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(transform)));
 
 	m_Triangles = m_ModelTriangles;
 	for (Triangle& triangle : m_Triangles)
@@ -1376,6 +1456,12 @@ void ComputeRenderer::ApplyModelTransform()
 		triangle.Vertex0 = glm::vec3(transform * glm::vec4(triangle.Vertex0, 1.0f));
 		triangle.Vertex1 = glm::vec3(transform * glm::vec4(triangle.Vertex1, 1.0f));
 		triangle.Vertex2 = glm::vec3(transform * glm::vec4(triangle.Vertex2, 1.0f));
+		if (triangle.HasVertexNormals)
+		{
+			triangle.Normal0 = glm::normalize(normalMatrix * triangle.Normal0);
+			triangle.Normal1 = glm::normalize(normalMatrix * triangle.Normal1);
+			triangle.Normal2 = glm::normalize(normalMatrix * triangle.Normal2);
+		}
 	}
 
 	UploadTriangleBuffer();

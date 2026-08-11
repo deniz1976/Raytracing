@@ -59,6 +59,10 @@ struct TriangleData
 	vec4 Vertex2;
 	vec4 AlbedoReflectivity;
 	vec4 RoughnessMaterial;
+	// Normal0.w is one when the OBJ supplied all three corner normals.
+	vec4 Normal0;
+	vec4 Normal1;
+	vec4 Normal2;
 };
 
 layout(std430, set = 0, binding = 5) readonly buffer TriangleBuffer
@@ -421,14 +425,19 @@ float HitSphere(Ray ray, SphereData sphere)
 
 // Moller-Trumbore expresses the hit in the triangle's two edge directions.
 // The barycentric u/v checks reject points outside without constructing a plane.
-float HitTriangle(Ray ray, TriangleData triangle, out vec3 outwardNormal)
+float HitTriangle(
+	Ray ray,
+	TriangleData triangle,
+	out vec3 geometricNormal,
+	out vec3 shadingNormal)
 {
 	vec3 vertex0 = triangle.Vertex0.xyz;
 	vec3 edge1 = triangle.Vertex1.xyz - vertex0;
 	vec3 edge2 = triangle.Vertex2.xyz - vertex0;
 	vec3 directionCrossEdge2 = cross(ray.Direction, edge2);
 	float determinant = dot(edge1, directionCrossEdge2);
-	outwardNormal = vec3(0.0);
+	geometricNormal = vec3(0.0);
+	shadingNormal = vec3(0.0);
 	if (abs(determinant) < 1e-8)
 		return -1.0;
 
@@ -452,7 +461,25 @@ float HitTriangle(Ray ray, TriangleData triangle, out vec3 outwardNormal)
 	vec3 normalCross = cross(edge1, edge2);
 	if (dot(normalCross, normalCross) <= 1e-16)
 		return -1.0;
-	outwardNormal = normalize(normalCross);
+	geometricNormal = normalize(normalCross);
+	shadingNormal = geometricNormal;
+	if (triangle.Normal0.w > 0.5)
+	{
+		float barycentricW = 1.0 - barycentricU - barycentricV;
+		vec3 interpolatedNormal =
+			triangle.Normal0.xyz * barycentricW +
+			triangle.Normal1.xyz * barycentricU +
+			triangle.Normal2.xyz * barycentricV;
+		if (dot(interpolatedNormal, interpolatedNormal) > 1e-12)
+		{
+			shadingNormal = normalize(interpolatedNormal);
+			// Imported normals may use the opposite winding convention. Keep the
+			// shading normal in the geometric normal's hemisphere before orienting
+			// both against the ray below.
+			if (dot(shadingNormal, geometricNormal) < 0.0)
+				shadingNormal = -shadingNormal;
+		}
+	}
 	return hitDistance;
 }
 
@@ -467,17 +494,22 @@ bool IntersectTriangleRange(
 	{
 		TriangleData triangle =
 			u_TriangleBuffer.Triangles[firstTriangle + offset];
-		vec3 outwardNormal;
-		float hitDistance = HitTriangle(ray, triangle, outwardNormal);
+		vec3 geometricNormal;
+		vec3 shadingNormal;
+		float hitDistance = HitTriangle(
+			ray,
+			triangle,
+			geometricNormal,
+			shadingNormal);
 		if (hitDistance > 0.0 && hitDistance < closestHit.Distance)
 		{
 			hitAnything = true;
 			closestHit.Distance = hitDistance;
 			closestHit.Position = ray.Origin + ray.Direction * hitDistance;
-			closestHit.FrontFace = dot(ray.Direction, outwardNormal) < 0.0;
+			closestHit.FrontFace = dot(ray.Direction, geometricNormal) < 0.0;
 			closestHit.Normal = closestHit.FrontFace
-				? outwardNormal
-				: -outwardNormal;
+				? shadingNormal
+				: -shadingNormal;
 			closestHit.SurfaceMaterial = GetTriangleMaterial(triangle);
 		}
 	}
@@ -705,11 +737,13 @@ bool IsOccluded(
 			triangleIndex < u_PushConstants.TriangleCount;
 			triangleIndex++)
 		{
-			vec3 outwardNormal;
+			vec3 geometricNormal;
+			vec3 shadingNormal;
 			float hitDistance = HitTriangle(
 				shadowRay,
 				u_TriangleBuffer.Triangles[triangleIndex],
-				outwardNormal);
+				geometricNormal,
+				shadingNormal);
 			if (hitDistance > 0.0 &&
 				hitDistance < maximumDistance - RAY_EPSILON)
 			{
@@ -742,11 +776,13 @@ bool IsOccluded(
 			{
 				for (uint offset = 0u; offset < node.Links.z; offset++)
 				{
-					vec3 outwardNormal;
+					vec3 geometricNormal;
+					vec3 shadingNormal;
 					float hitDistance = HitTriangle(
 						shadowRay,
 						u_TriangleBuffer.Triangles[node.Links.x + offset],
-						outwardNormal);
+						geometricNormal,
+						shadingNormal);
 					if (hitDistance > 0.0 &&
 						hitDistance < maximumDistance - RAY_EPSILON)
 					{
