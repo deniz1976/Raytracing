@@ -315,7 +315,9 @@ public:
 			else if (sphere.Type == ComputeRenderer::MaterialType::Metal)
 			{
 				ImGui::TextWrapped(
-					"Metal reflects a tinted ray instead of using diffuse lighting.");
+					"Metal uses a GGX microfacet reflection model. Albedo is the "
+					"normal-incidence reflection colour, roughness spreads the "
+					"microfacet normals, and strength scales the reflected energy.");
 				sphereChanged |= ImGui::SliderFloat(
 					"Reflection Strength",
 					&sphere.Reflectivity,

@@ -199,6 +199,147 @@ float LambertPdf(vec3 surfaceNormal, vec3 sampledDirection)
 	return max(dot(surfaceNormal, sampledDirection), 0.0) / PI;
 }
 
+vec3 FresnelSchlick(float cosine, vec3 reflectanceAtNormalIncidence)
+{
+	return reflectanceAtNormalIncidence +
+		(vec3(1.0) - reflectanceAtNormalIncidence) *
+		pow(1.0 - cosine, 5.0);
+}
+
+float GgxDistribution(float normalDotHalfway, float alpha)
+{
+	float alphaSquared = alpha * alpha;
+	float denominator =
+		normalDotHalfway * normalDotHalfway *
+		(alphaSquared - 1.0) + 1.0;
+	return alphaSquared /
+		max(PI * denominator * denominator, 1e-8);
+}
+
+float SmithGgxMasking(float normalDotDirection, float alpha)
+{
+	float alphaSquared = alpha * alpha;
+	float root = sqrt(
+		alphaSquared +
+		(1.0 - alphaSquared) *
+		normalDotDirection * normalDotDirection);
+	return
+		2.0 * normalDotDirection /
+		max(normalDotDirection + root, 1e-8);
+}
+
+vec3 EvaluateMetalBrdf(
+	Material material,
+	vec3 surfaceNormal,
+	vec3 viewDirection,
+	vec3 lightDirection)
+{
+	float normalDotView = max(dot(surfaceNormal, viewDirection), 0.0);
+	float normalDotLight = max(dot(surfaceNormal, lightDirection), 0.0);
+	if (normalDotView <= 0.0 || normalDotLight <= 0.0)
+		return vec3(0.0);
+
+	vec3 halfwaySum = viewDirection + lightDirection;
+	if (dot(halfwaySum, halfwaySum) <= 1e-12)
+		return vec3(0.0);
+
+	vec3 halfwayDirection = normalize(halfwaySum);
+	float normalDotHalfway = max(dot(surfaceNormal, halfwayDirection), 0.0);
+	float viewDotHalfway = max(dot(viewDirection, halfwayDirection), 0.0);
+	float alpha = max(material.Roughness * material.Roughness, 0.001);
+
+	vec3 fresnel =
+		FresnelSchlick(viewDotHalfway, material.Albedo) *
+		material.Reflectivity;
+	float distribution = GgxDistribution(normalDotHalfway, alpha);
+	float geometry =
+		SmithGgxMasking(normalDotView, alpha) *
+		SmithGgxMasking(normalDotLight, alpha);
+
+	return
+		fresnel * distribution * geometry /
+		max(4.0 * normalDotView * normalDotLight, 1e-8);
+}
+
+float MetalReflectionPdf(
+	Material material,
+	vec3 surfaceNormal,
+	vec3 viewDirection,
+	vec3 reflectedDirection)
+{
+	vec3 halfwaySum = viewDirection + reflectedDirection;
+	if (dot(halfwaySum, halfwaySum) <= 1e-12)
+		return 0.0;
+
+	vec3 halfwayDirection = normalize(halfwaySum);
+	float normalDotHalfway = max(dot(surfaceNormal, halfwayDirection), 0.0);
+	float viewDotHalfway = max(dot(viewDirection, halfwayDirection), 0.0);
+	if (normalDotHalfway <= 0.0 || viewDotHalfway <= 0.0)
+		return 0.0;
+
+	float alpha = max(material.Roughness * material.Roughness, 0.001);
+	float halfwayPdf =
+		GgxDistribution(normalDotHalfway, alpha) *
+		normalDotHalfway;
+	return halfwayPdf / (4.0 * viewDotHalfway);
+}
+
+vec3 SampleGgxReflection(
+	Material material,
+	vec3 surfaceNormal,
+	vec3 viewDirection,
+	inout uint randomState)
+{
+	float alpha = max(material.Roughness * material.Roughness, 0.001);
+	float alphaSquared = alpha * alpha;
+	float firstRandom = NextRandom(randomState);
+	float secondRandom = NextRandom(randomState);
+	float angle = 2.0 * PI * firstRandom;
+	float cosTheta = sqrt(
+		(1.0 - secondRandom) /
+		max(1.0 + (alphaSquared - 1.0) * secondRandom, 1e-8));
+	float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+	vec3 localHalfway = vec3(
+		cos(angle) * sinTheta,
+		sin(angle) * sinTheta,
+		cosTheta);
+	vec3 halfwayDirection = LocalToWorld(localHalfway, surfaceNormal);
+	if (dot(viewDirection, halfwayDirection) < 0.0)
+		halfwayDirection = -halfwayDirection;
+
+	return normalize(reflect(-viewDirection, halfwayDirection));
+}
+
+vec3 EvaluateSurfaceBrdf(
+	Material material,
+	vec3 surfaceNormal,
+	vec3 viewDirection,
+	vec3 lightDirection)
+{
+	return material.Type == MATERIAL_METAL
+		? EvaluateMetalBrdf(
+			material,
+			surfaceNormal,
+			viewDirection,
+			lightDirection)
+		: EvaluateLambertBrdf(material);
+}
+
+float SurfaceDirectionPdf(
+	Material material,
+	vec3 surfaceNormal,
+	vec3 viewDirection,
+	vec3 sampledDirection)
+{
+	return material.Type == MATERIAL_METAL
+		? MetalReflectionPdf(
+			material,
+			surfaceNormal,
+			viewDirection,
+			sampledDirection)
+		: LambertPdf(surfaceNormal, sampledDirection);
+}
+
 Material GetSphereMaterial(SphereData sphere)
 {
 	Material material;
@@ -542,6 +683,7 @@ vec3 CalculateSphereLight(
 	SphereLight light,
 	Material material,
 	vec3 surfaceNormal,
+	vec3 viewDirection,
 	vec3 directionToLight,
 	float lightTechniquePdf,
 	float bsdfPdf,
@@ -552,7 +694,11 @@ vec3 CalculateSphereLight(
 		return vec3(0.0);
 
 	vec3 emittedRadiance = light.Color * light.Intensity;
-	vec3 brdf = EvaluateLambertBrdf(material);
+	vec3 brdf = EvaluateSurfaceBrdf(
+		material,
+		surfaceNormal,
+		viewDirection,
+		directionToLight);
 	float misWeight = PowerHeuristic(lightTechniquePdf, bsdfPdf);
 	return
 		brdf *
@@ -611,6 +757,7 @@ bool SelectSphereLight(
 vec3 SampleSphereLight(
 	uint lightIndex,
 	HitRecord hit,
+	vec3 viewDirection,
 	inout uint randomState,
 	float lightSelectionProbability)
 {
@@ -674,11 +821,16 @@ vec3 SampleSphereLight(
 	float lightVisibility = isInShadow ? 0.0 : 1.0;
 	float lightTechniquePdf =
 		lightSelectionProbability * lightDirectionPdf;
-	float bsdfPdf = LambertPdf(hit.Normal, directionToLight);
+	float bsdfPdf = SurfaceDirectionPdf(
+		hit.SurfaceMaterial,
+		hit.Normal,
+		viewDirection,
+		directionToLight);
 	return CalculateSphereLight(
 		light,
 		hit.SurfaceMaterial,
 		hit.Normal,
+		viewDirection,
 		directionToLight,
 		lightTechniquePdf,
 		bsdfPdf,
@@ -713,7 +865,7 @@ vec3 TraceRay(
 	uint randomState = randomSeed;
 	uint lightCount = u_PushConstants.SceneSettings.y;
 	bool sampleOneLight = u_PushConstants.SceneSettings.z != 0u;
-	bool previousBounceWasDiffuse = false;
+	bool previousBounceUsedDirectLighting = false;
 	vec3 previousSurfacePosition = vec3(0.0);
 	float previousBsdfPdf = 0.0;
 
@@ -756,7 +908,7 @@ vec3 TraceRay(
 			hitLightIndex))
 		{
 			float emitterWeight = 1.0;
-			if (previousBounceWasDiffuse)
+			if (previousBounceUsedDirectLighting)
 			{
 				SphereLight hitLight = GetSphereLight(hitLightIndex);
 				float lightSelectionProbability = sampleOneLight
@@ -784,12 +936,14 @@ vec3 TraceRay(
 		}
 
 		Material material = closestHit.SurfaceMaterial;
-		bool usesDiffuseLighting =
+		bool usesDirectLighting =
 			material.Type == MATERIAL_LEGACY ||
-			material.Type == MATERIAL_DIFFUSE;
+			material.Type == MATERIAL_DIFFUSE ||
+			material.Type == MATERIAL_METAL;
 		vec3 surfaceColor = vec3(0.0);
+		vec3 viewDirection = normalize(-ray.Direction);
 
-		if (usesDiffuseLighting)
+		if (usesDirectLighting)
 		{
 			if (sampleOneLight && lightCount > 0u)
 			{
@@ -807,6 +961,7 @@ vec3 TraceRay(
 					surfaceColor += SampleSphereLight(
 						lightIndex,
 						closestHit,
+						viewDirection,
 						randomState,
 						selectionProbability);
 				}
@@ -820,6 +975,7 @@ vec3 TraceRay(
 					surfaceColor += SampleSphereLight(
 						lightIndex,
 						closestHit,
+						viewDirection,
 						randomState,
 						1.0);
 				}
@@ -849,7 +1005,7 @@ vec3 TraceRay(
 				EvaluateLambertBrdf(material) *
 				surfaceCosine /
 				directionPdf;
-			previousBounceWasDiffuse = true;
+			previousBounceUsedDirectLighting = true;
 			previousSurfacePosition = closestHit.Position;
 			previousBsdfPdf = directionPdf;
 			continue;
@@ -899,7 +1055,7 @@ vec3 TraceRay(
 			// Offsetting along the new direction puts an entering ray inside and an
 			// exiting ray outside without assuming which side reflection chose.
 			ray.Origin = closestHit.Position + ray.Direction * RAY_EPSILON;
-			previousBounceWasDiffuse = false;
+			previousBounceUsedDirectLighting = false;
 			continue;
 		}
 
@@ -915,8 +1071,43 @@ vec3 TraceRay(
 		if (reflectivity <= 0.0)
 			break;
 
-		// Metal has no Lambert term in this small model. Its albedo tints the
-		// reflected light, while reflection strength controls how much survives.
+		if (material.Type == MATERIAL_METAL)
+		{
+			accumulatedColor += throughput * surfaceColor;
+			ray.Origin =
+				closestHit.Position +
+				closestHit.Normal * RAY_EPSILON;
+			ray.Direction = SampleGgxReflection(
+				material,
+				closestHit.Normal,
+				viewDirection,
+				randomState);
+			float surfaceCosine = max(dot(
+				closestHit.Normal,
+				ray.Direction), 0.0);
+			float directionPdf = MetalReflectionPdf(
+				material,
+				closestHit.Normal,
+				viewDirection,
+				ray.Direction);
+			if (surfaceCosine <= 0.0 || directionPdf <= 0.0)
+				break;
+
+			throughput *=
+				EvaluateMetalBrdf(
+					material,
+					closestHit.Normal,
+					viewDirection,
+					ray.Direction) *
+				surfaceCosine /
+				directionPdf;
+			previousBounceUsedDirectLighting = true;
+			previousSurfacePosition = closestHit.Position;
+			previousBsdfPdf = directionPdf;
+			continue;
+		}
+
+		// Legacy keeps the original tinted reflection model for old scene files.
 		throughput *= material.Albedo * reflectivity;
 
 		ray.Origin =
@@ -936,7 +1127,7 @@ vec3 TraceRay(
 			perfectReflection,
 			randomDirection,
 			roughness));
-		previousBounceWasDiffuse = false;
+		previousBounceUsedDirectLighting = false;
 	}
 
 	return accumulatedColor;
