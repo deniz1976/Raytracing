@@ -4,6 +4,8 @@
 
 #include "backends/imgui_impl_vulkan.h"
 
+#include <glm/gtc/matrix_transform.hpp>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -473,6 +475,7 @@ void ComputeRenderer::CreateTriangleBuffer()
 			MaterialType::Diffuse,
 			1.5f }
 	};
+	m_ModelTriangles = m_Triangles;
 
 	const VkDeviceSize bufferSize =
 		sizeof(GpuTriangle) * MaxTriangleCount;
@@ -1306,10 +1309,76 @@ bool ComputeRenderer::LoadObj(
 
 	// Commit only after the whole file passes validation. A malformed model
 	// therefore cannot erase the triangles that are currently being displayed.
-	m_Triangles = std::move(loadedTriangles);
+	m_ModelTriangles = std::move(loadedTriangles);
+	ApplyModelTransform();
+	return true;
+}
+
+void ComputeRenderer::SetModelTransform(const ModelTransform& transform)
+{
+	ModelTransform sanitized = transform;
+	if (!std::isfinite(sanitized.Position.x) ||
+		!std::isfinite(sanitized.Position.y) ||
+		!std::isfinite(sanitized.Position.z))
+	{
+		sanitized.Position = { 0.0f, 0.0f, 0.0f };
+	}
+	if (!std::isfinite(sanitized.Rotation.x) ||
+		!std::isfinite(sanitized.Rotation.y) ||
+		!std::isfinite(sanitized.Rotation.z))
+	{
+		sanitized.Rotation = { 0.0f, 0.0f, 0.0f };
+	}
+	if (!std::isfinite(sanitized.Scale.x) ||
+		!std::isfinite(sanitized.Scale.y) ||
+		!std::isfinite(sanitized.Scale.z))
+	{
+		sanitized.Scale = { 1.0f, 1.0f, 1.0f };
+	}
+	sanitized.Scale = glm::clamp(
+		sanitized.Scale,
+		glm::vec3(0.01f),
+		glm::vec3(100.0f));
+
+	if (sanitized.Position == m_ModelTransform.Position &&
+		sanitized.Rotation == m_ModelTransform.Rotation &&
+		sanitized.Scale == m_ModelTransform.Scale)
+	{
+		return;
+	}
+
+	m_ModelTransform = sanitized;
+	ApplyModelTransform();
+}
+
+void ComputeRenderer::ApplyModelTransform()
+{
+	glm::mat4 transform(1.0f);
+	transform = glm::translate(transform, m_ModelTransform.Position);
+	transform = glm::rotate(
+		transform,
+		glm::radians(m_ModelTransform.Rotation.z),
+		{ 0.0f, 0.0f, 1.0f });
+	transform = glm::rotate(
+		transform,
+		glm::radians(m_ModelTransform.Rotation.y),
+		{ 0.0f, 1.0f, 0.0f });
+	transform = glm::rotate(
+		transform,
+		glm::radians(m_ModelTransform.Rotation.x),
+		{ 1.0f, 0.0f, 0.0f });
+	transform = glm::scale(transform, m_ModelTransform.Scale);
+
+	m_Triangles = m_ModelTriangles;
+	for (Triangle& triangle : m_Triangles)
+	{
+		triangle.Vertex0 = glm::vec3(transform * glm::vec4(triangle.Vertex0, 1.0f));
+		triangle.Vertex1 = glm::vec3(transform * glm::vec4(triangle.Vertex1, 1.0f));
+		triangle.Vertex2 = glm::vec3(transform * glm::vec4(triangle.Vertex2, 1.0f));
+	}
+
 	UploadTriangleBuffer();
 	ResetAccumulation();
-	return true;
 }
 
 bool ComputeRenderer::SaveScene(

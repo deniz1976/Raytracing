@@ -24,6 +24,11 @@ public:
 		std::string errorMessage;
 		if (m_Renderer.LoadObj(m_ObjPath.data(), errorMessage))
 		{
+			ComputeRenderer::ModelTransform previewTransform;
+			previewTransform.Position = { 0.0f, 0.0f, 1.5f };
+			previewTransform.Rotation = { -10.0f, 25.0f, 0.0f };
+			previewTransform.Scale = { 0.6f, 0.6f, 0.6f };
+			m_Renderer.SetModelTransform(previewTransform);
 			m_SceneStatus = "OBJ loaded: " +
 				std::to_string(m_Renderer.GetTriangleCount()) +
 				" triangles.";
@@ -258,6 +263,34 @@ public:
 		ImGui::TextWrapped(
 			"OBJ faces replace the current triangle model. Polygon faces are "
 			"triangulated and use a default diffuse material.");
+
+		ComputeRenderer::ModelTransform modelTransform =
+			m_Renderer.GetModelTransform();
+		bool modelTransformChanged = false;
+		modelTransformChanged |= ImGui::DragFloat3(
+			"Model Position",
+			&modelTransform.Position.x,
+			0.05f);
+		modelTransformChanged |= ImGui::DragFloat3(
+			"Model Rotation",
+			&modelTransform.Rotation.x,
+			0.5f);
+		modelTransformChanged |= ImGui::DragFloat3(
+			"Model Scale",
+			&modelTransform.Scale.x,
+			0.01f,
+			0.01f,
+			100.0f);
+		if (ImGui::Button("Reset Model Transform"))
+		{
+			modelTransform = {};
+			modelTransformChanged = true;
+		}
+		if (modelTransformChanged)
+			m_Renderer.SetModelTransform(modelTransform);
+		ImGui::TextWrapped(
+			"Rotation uses degrees. Scale is applied per axis and remains "
+			"positive to preserve triangle orientation.");
 		ImGui::Text(
 			"Spheres: %u / %u",
 			sphereCount,

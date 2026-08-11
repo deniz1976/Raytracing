@@ -49,6 +49,13 @@ public:
 		float IndexOfRefraction = 1.5f;
 	};
 
+	struct ModelTransform
+	{
+		glm::vec3 Position{ 0.0f };
+		glm::vec3 Rotation{ 0.0f };
+		glm::vec3 Scale{ 1.0f };
+	};
+
 	// Yaw and pitch are stored in degrees instead of a forward vector because
 	// they are what the UI edits and what a scene file can round trip; the
 	// renderer derives the forward vector from them.
@@ -99,6 +106,8 @@ public:
 	bool SaveScene(const std::string& path, std::string& errorMessage) const;
 	bool LoadScene(const std::string& path, std::string& errorMessage);
 	bool LoadObj(const std::string& path, std::string& errorMessage);
+	const ModelTransform& GetModelTransform() const { return m_ModelTransform; }
+	void SetModelTransform(const ModelTransform& transform);
 	const SphereLight& GetLight(uint32_t index) const;
 	void SetLight(uint32_t index, const SphereLight& light);
 	bool AddLight();
@@ -173,6 +182,7 @@ private:
 	void UploadLightBuffer();
 	void UploadTriangleBuffer();
 	void BuildTriangleBvh();
+	void ApplyModelTransform();
 
 	// What the surface area heuristic concluded about one range of spheres.
 	// NoCandidate is not a failure: it means every centroid fell on the same
@@ -219,6 +229,8 @@ private:
 	uint32_t m_BounceCount = 3;
 	std::vector<Sphere> m_Spheres;
 	std::vector<Triangle> m_Triangles;
+	std::vector<Triangle> m_ModelTriangles;
+	ModelTransform m_ModelTransform;
 	std::vector<uint32_t> m_TriangleOrder;
 	uint32_t m_TriangleBvhNodeCount = 0;
 	uint32_t m_TriangleBvhDepth = 0;
