@@ -477,7 +477,18 @@ void ComputeRenderer::CreateTriangleBuffer()
 	const VkDeviceSize bufferSize =
 		sizeof(GpuTriangle) * MaxTriangleCount;
 	CreateHostBuffer(bufferSize, m_TriangleBuffer, m_TriangleBufferMemory);
+	CreateTriangleBvhBuffer();
 	UploadTriangleBuffer();
+}
+
+void ComputeRenderer::CreateTriangleBvhBuffer()
+{
+	const VkDeviceSize bufferSize =
+		sizeof(GpuBvhNode) * MaxTriangleBvhNodeCount;
+	CreateHostBuffer(
+		bufferSize,
+		m_TriangleBvhBuffer,
+		m_TriangleBvhBufferMemory);
 }
 
 void ComputeRenderer::CreateBvhBuffer()
@@ -974,12 +985,15 @@ void ComputeRenderer::UploadLightBuffer()
 
 void ComputeRenderer::UploadTriangleBuffer()
 {
+	BuildTriangleBvh();
+
 	std::array<GpuTriangle, MaxTriangleCount> gpuTriangles{};
 	for (size_t triangleIndex = 0;
 		triangleIndex < m_Triangles.size();
 		triangleIndex++)
 	{
-		const Triangle& triangle = m_Triangles[triangleIndex];
+		const Triangle& triangle =
+			m_Triangles[m_TriangleOrder[triangleIndex]];
 		GpuTriangle& gpuTriangle = gpuTriangles[triangleIndex];
 		gpuTriangle.Vertex0 = glm::vec4(triangle.Vertex0, 0.0f);
 		gpuTriangle.Vertex1 = glm::vec4(triangle.Vertex1, 0.0f);
@@ -997,6 +1011,124 @@ void ComputeRenderer::UploadTriangleBuffer()
 		m_TriangleBufferMemory,
 		gpuTriangles.data(),
 		sizeof(gpuTriangles));
+}
+
+void ComputeRenderer::BuildTriangleBvh()
+{
+	const uint32_t triangleCount = GetTriangleCount();
+	m_TriangleOrder.resize(triangleCount);
+	for (uint32_t triangleIndex = 0;
+		triangleIndex < triangleCount;
+		triangleIndex++)
+	{
+		m_TriangleOrder[triangleIndex] = triangleIndex;
+	}
+
+	m_TriangleBvhNodeCount = 0;
+	m_TriangleBvhDepth = 0;
+	std::array<GpuBvhNode, MaxTriangleBvhNodeCount> nodes{};
+	if (triangleCount == 0)
+	{
+		WriteHostBuffer(
+			m_TriangleBvhBufferMemory,
+			nodes.data(),
+			sizeof(nodes));
+		return;
+	}
+
+	constexpr uint32_t leafTriangleCount = 4;
+	std::vector<BvhBuildEntry> pending;
+	pending.push_back({ 0, triangleCount, 0, 1 });
+	m_TriangleBvhNodeCount = 1;
+
+	while (!pending.empty())
+	{
+		const BvhBuildEntry entry = pending.back();
+		pending.pop_back();
+		m_TriangleBvhDepth = std::max(
+			m_TriangleBvhDepth,
+			entry.Depth);
+
+		BvhBounds nodeBounds;
+		BvhBounds centroidBounds;
+		for (uint32_t offset = 0; offset < entry.Count; offset++)
+		{
+			const Triangle& triangle =
+				m_Triangles[m_TriangleOrder[entry.Start + offset]];
+			nodeBounds.Grow(triangle.Vertex0);
+			nodeBounds.Grow(triangle.Vertex1);
+			nodeBounds.Grow(triangle.Vertex2);
+			centroidBounds.Grow(
+				(triangle.Vertex0 + triangle.Vertex1 + triangle.Vertex2) /
+				3.0f);
+		}
+
+		// A perfectly flat triangle has a zero-size box on one axis. A tiny
+		// expansion makes the slab test conservative around floating-point edges.
+		const glm::vec3 boundsPadding(1e-4f);
+		GpuBvhNode& node = nodes[entry.NodeIndex];
+		node.BoundsMin = glm::vec4(nodeBounds.Min - boundsPadding, 0.0f);
+		node.BoundsMax = glm::vec4(nodeBounds.Max + boundsPadding, 0.0f);
+
+		if (entry.Count <= leafTriangleCount)
+		{
+			node.Links = glm::uvec4(entry.Start, 0, entry.Count, 0);
+			continue;
+		}
+
+		const glm::vec3 centroidExtent =
+			centroidBounds.Max - centroidBounds.Min;
+		uint32_t splitAxis = 0;
+		if (centroidExtent.y > centroidExtent.x)
+			splitAxis = 1;
+		if (centroidExtent.z > centroidExtent[splitAxis])
+			splitAxis = 2;
+
+		const uint32_t leftCount = entry.Count / 2;
+		const auto rangeBegin = m_TriangleOrder.begin() + entry.Start;
+		const auto rangeMiddle = rangeBegin + leftCount;
+		const auto rangeEnd = rangeBegin + entry.Count;
+		std::nth_element(
+			rangeBegin,
+			rangeMiddle,
+			rangeEnd,
+			[this, splitAxis](uint32_t leftIndex, uint32_t rightIndex)
+			{
+				const Triangle& left = m_Triangles[leftIndex];
+				const Triangle& right = m_Triangles[rightIndex];
+				const float leftCentroid =
+					(left.Vertex0[splitAxis] + left.Vertex1[splitAxis] +
+						left.Vertex2[splitAxis]) / 3.0f;
+				const float rightCentroid =
+					(right.Vertex0[splitAxis] + right.Vertex1[splitAxis] +
+						right.Vertex2[splitAxis]) / 3.0f;
+				return leftCentroid < rightCentroid;
+			});
+
+		const uint32_t leftChildIndex = m_TriangleBvhNodeCount;
+		const uint32_t rightChildIndex = m_TriangleBvhNodeCount + 1;
+		m_TriangleBvhNodeCount += 2;
+		node.Links = glm::uvec4(
+			leftChildIndex,
+			rightChildIndex,
+			0,
+			splitAxis);
+		pending.push_back({
+			entry.Start,
+			leftCount,
+			leftChildIndex,
+			entry.Depth + 1 });
+		pending.push_back({
+			entry.Start + leftCount,
+			entry.Count - leftCount,
+			rightChildIndex,
+			entry.Depth + 1 });
+	}
+
+	WriteHostBuffer(
+		m_TriangleBvhBufferMemory,
+		nodes.data(),
+		sizeof(nodes));
 }
 
 const ComputeRenderer::Sphere& ComputeRenderer::GetSphere(uint32_t index) const
@@ -1881,7 +2013,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 {
 	VkDevice device = Walnut::Application::GetDevice();
 
-	VkDescriptorSetLayoutBinding descriptorBindings[6]{};
+	VkDescriptorSetLayoutBinding descriptorBindings[7]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorBindings[bindingIndex].binding = bindingIndex;
@@ -1889,7 +2021,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorBindings[bindingIndex].descriptorCount = 1;
 		descriptorBindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 	}
-	for (uint32_t bindingIndex = 2; bindingIndex < 6; bindingIndex++)
+	for (uint32_t bindingIndex = 2; bindingIndex < 7; bindingIndex++)
 	{
 		descriptorBindings[bindingIndex].binding = bindingIndex;
 		descriptorBindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1899,7 +2031,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 6;
+	layoutInfo.bindingCount = 7;
 	layoutInfo.pBindings = descriptorBindings;
 	check_vk_result(vkCreateDescriptorSetLayout(
 		device, &layoutInfo, nullptr, &m_ComputeDescriptorSetLayout));
@@ -1908,7 +2040,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	poolSizes[0].descriptorCount = 2;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSizes[1].descriptorCount = 4;
+	poolSizes[1].descriptorCount = 5;
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1931,7 +2063,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 	descriptorImages[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 	descriptorImages[1].imageView = m_AccumulationImageView;
 	descriptorImages[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-	VkDescriptorBufferInfo descriptorBuffers[4]{};
+	VkDescriptorBufferInfo descriptorBuffers[5]{};
 	descriptorBuffers[0].buffer = m_SphereBuffer;
 	descriptorBuffers[0].offset = 0;
 	descriptorBuffers[0].range = VK_WHOLE_SIZE;
@@ -1944,8 +2076,11 @@ void ComputeRenderer::CreateComputeDescriptors()
 	descriptorBuffers[3].buffer = m_TriangleBuffer;
 	descriptorBuffers[3].offset = 0;
 	descriptorBuffers[3].range = VK_WHOLE_SIZE;
+	descriptorBuffers[4].buffer = m_TriangleBvhBuffer;
+	descriptorBuffers[4].offset = 0;
+	descriptorBuffers[4].range = VK_WHOLE_SIZE;
 
-	VkWriteDescriptorSet descriptorWrites[6]{};
+	VkWriteDescriptorSet descriptorWrites[7]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorWrites[bindingIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1955,7 +2090,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorWrites[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 		descriptorWrites[bindingIndex].pImageInfo = &descriptorImages[bindingIndex];
 	}
-	for (uint32_t bindingIndex = 2; bindingIndex < 6; bindingIndex++)
+	for (uint32_t bindingIndex = 2; bindingIndex < 7; bindingIndex++)
 	{
 		descriptorWrites[bindingIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 		descriptorWrites[bindingIndex].dstSet = m_ComputeDescriptorSet;
@@ -1964,7 +2099,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 		descriptorWrites[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 		descriptorWrites[bindingIndex].pBufferInfo = &descriptorBuffers[bindingIndex - 2];
 	}
-	vkUpdateDescriptorSets(device, 6, descriptorWrites, 0, nullptr);
+	vkUpdateDescriptorSets(device, 7, descriptorWrites, 0, nullptr);
 }
 
 void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)
@@ -2162,6 +2297,8 @@ void ComputeRenderer::Release()
 	VkDeviceMemory lightBufferMemory = m_LightBufferMemory;
 	VkBuffer triangleBuffer = m_TriangleBuffer;
 	VkDeviceMemory triangleBufferMemory = m_TriangleBufferMemory;
+	VkBuffer triangleBvhBuffer = m_TriangleBvhBuffer;
+	VkDeviceMemory triangleBvhBufferMemory = m_TriangleBvhBufferMemory;
 	VkQueryPool timestampQueryPool = m_TimestampQueryPool;
 
 	Walnut::Application::SubmitResourceFree(
@@ -2170,7 +2307,8 @@ void ComputeRenderer::Release()
 		 accumulationImageView, accumulationImage, accumulationImageMemory,
 			 sphereBuffer, sphereBufferMemory, bvhBuffer, bvhBufferMemory,
 			 lightBuffer, lightBufferMemory, triangleBuffer,
-			 triangleBufferMemory, timestampQueryPool]()
+			 triangleBufferMemory, triangleBvhBuffer,
+			 triangleBvhBufferMemory, timestampQueryPool]()
 		{
 			VkDevice device = Walnut::Application::GetDevice();
 			if (timestampQueryPool != VK_NULL_HANDLE)
@@ -2194,6 +2332,8 @@ void ComputeRenderer::Release()
 			vkFreeMemory(device, lightBufferMemory, nullptr);
 			vkDestroyBuffer(device, triangleBuffer, nullptr);
 			vkFreeMemory(device, triangleBufferMemory, nullptr);
+			vkDestroyBuffer(device, triangleBvhBuffer, nullptr);
+			vkFreeMemory(device, triangleBvhBufferMemory, nullptr);
 		});
 
 	m_OutputImage = VK_NULL_HANDLE;

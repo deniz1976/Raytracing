@@ -62,6 +62,7 @@ public:
 
 	static constexpr uint32_t MaxSphereCount = 512;
 	static constexpr uint32_t MaxTriangleCount = 4096;
+	static constexpr uint32_t MaxTriangleBvhNodeCount = 2 * MaxTriangleCount;
 
 	// A binary tree over N primitives needs at most 2N-1 nodes, so this capacity
 	// can always hold a tree built over MaxSphereCount spheres.
@@ -129,6 +130,8 @@ public:
 	uint32_t GetFrameIndex() const { return m_FrameIndex; }
 	uint32_t GetSphereCount() const { return static_cast<uint32_t>(m_Spheres.size()); }
 	uint32_t GetTriangleCount() const { return static_cast<uint32_t>(m_Triangles.size()); }
+	uint32_t GetTriangleBvhNodeCount() const { return m_TriangleBvhNodeCount; }
+	uint32_t GetTriangleBvhDepth() const { return m_TriangleBvhDepth; }
 	uint32_t GetLightCount() const { return static_cast<uint32_t>(m_Lights.size()); }
 	uint32_t GetBvhNodeCount() const { return m_BvhNodeCount; }
 	uint32_t GetBvhDepth() const { return m_BvhDepth; }
@@ -157,6 +160,7 @@ private:
 	void CreateBvhBuffer();
 	void CreateLightBuffer();
 	void CreateTriangleBuffer();
+	void CreateTriangleBvhBuffer();
 	void CreateHostBuffer(
 		VkDeviceSize size,
 		VkBuffer& buffer,
@@ -168,6 +172,7 @@ private:
 	void UploadSceneBuffer();
 	void UploadLightBuffer();
 	void UploadTriangleBuffer();
+	void BuildTriangleBvh();
 
 	// What the surface area heuristic concluded about one range of spheres.
 	// NoCandidate is not a failure: it means every centroid fell on the same
@@ -214,6 +219,9 @@ private:
 	uint32_t m_BounceCount = 3;
 	std::vector<Sphere> m_Spheres;
 	std::vector<Triangle> m_Triangles;
+	std::vector<uint32_t> m_TriangleOrder;
+	uint32_t m_TriangleBvhNodeCount = 0;
+	uint32_t m_TriangleBvhDepth = 0;
 	std::vector<SphereLight> m_Lights;
 
 	bool m_UseBvh = true;
@@ -256,6 +264,8 @@ private:
 
 	VkBuffer m_TriangleBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_TriangleBufferMemory = VK_NULL_HANDLE;
+	VkBuffer m_TriangleBvhBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_TriangleBvhBufferMemory = VK_NULL_HANDLE;
 
 	VkImage m_OutputImage = VK_NULL_HANDLE;
 	VkDeviceMemory m_OutputImageMemory = VK_NULL_HANDLE;

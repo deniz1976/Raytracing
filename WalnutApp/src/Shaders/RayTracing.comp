@@ -66,6 +66,11 @@ layout(std430, set = 0, binding = 5) readonly buffer TriangleBuffer
 	TriangleData Triangles[];
 } u_TriangleBuffer;
 
+layout(std430, set = 0, binding = 6) readonly buffer TriangleBvhBuffer
+{
+	BvhNodeData Nodes[];
+} u_TriangleBvhBuffer;
+
 layout(push_constant) uniform PushConstants
 {
 	vec4 CameraPosition;
@@ -451,14 +456,17 @@ float HitTriangle(Ray ray, TriangleData triangle, out vec3 outwardNormal)
 	return hitDistance;
 }
 
-bool IntersectTriangles(Ray ray, inout HitRecord closestHit)
+bool IntersectTriangleRange(
+	Ray ray,
+	uint firstTriangle,
+	uint triangleCount,
+	inout HitRecord closestHit)
 {
 	bool hitAnything = false;
-	for (uint triangleIndex = 0u;
-		triangleIndex < u_PushConstants.TriangleCount;
-		triangleIndex++)
+	for (uint offset = 0u; offset < triangleCount; offset++)
 	{
-		TriangleData triangle = u_TriangleBuffer.Triangles[triangleIndex];
+		TriangleData triangle =
+			u_TriangleBuffer.Triangles[firstTriangle + offset];
 		vec3 outwardNormal;
 		float hitDistance = HitTriangle(ray, triangle, outwardNormal);
 		if (hitDistance > 0.0 && hitDistance < closestHit.Distance)
@@ -520,6 +528,55 @@ bool HitAabb(
 		farPlanes.z);
 
 	return entryDistance <= exitDistance && entryDistance < maximumDistance;
+}
+
+bool IntersectTriangleBvh(Ray ray, inout HitRecord closestHit)
+{
+	bool hitAnything = false;
+	vec3 inverseDirection = SafeInverseDirection(ray.Direction);
+	uint nodeStack[BVH_STACK_SIZE];
+	int stackSize = 0;
+	nodeStack[stackSize++] = 0u;
+
+	while (stackSize > 0)
+	{
+		BvhNodeData node =
+			u_TriangleBvhBuffer.Nodes[nodeStack[--stackSize]];
+		if (!HitAabb(
+			ray.Origin,
+			inverseDirection,
+			node.BoundsMin.xyz,
+			node.BoundsMax.xyz,
+			closestHit.Distance))
+		{
+			continue;
+		}
+
+		if (node.Links.z > 0u)
+		{
+			if (IntersectTriangleRange(
+				ray,
+				node.Links.x,
+				node.Links.z,
+				closestHit))
+			{
+				hitAnything = true;
+			}
+			continue;
+		}
+
+		if (stackSize + 2 <= BVH_STACK_SIZE)
+		{
+			int splitAxis = int(node.Links.w);
+			bool leftIsNear = ray.Direction[splitAxis] >= 0.0;
+			nodeStack[stackSize++] = leftIsNear
+				? node.Links.y : node.Links.x;
+			nodeStack[stackSize++] = leftIsNear
+				? node.Links.x : node.Links.y;
+		}
+	}
+
+	return hitAnything;
 }
 
 // Tests one contiguous run of the sphere buffer and keeps the nearest hit. The
@@ -616,8 +673,18 @@ bool TraceScene(
 		}
 	}
 
-	if (IntersectTriangles(ray, closestHit))
-		hitAnything = true;
+	if (u_PushConstants.TriangleCount > 0u)
+	{
+		bool hitTriangles = u_PushConstants.SceneSettings.x == 0u
+			? IntersectTriangleRange(
+				ray,
+				0u,
+				u_PushConstants.TriangleCount,
+				closestHit)
+			: IntersectTriangleBvh(ray, closestHit);
+		if (hitTriangles)
+			hitAnything = true;
+	}
 
 	return hitAnything;
 }
@@ -632,19 +699,68 @@ bool IsOccluded(
 	shadowRay.Origin = surfacePosition + surfaceNormal * RAY_EPSILON;
 	shadowRay.Direction = directionToLight;
 
-	for (uint triangleIndex = 0u;
-		triangleIndex < u_PushConstants.TriangleCount;
-		triangleIndex++)
+	if (u_PushConstants.SceneSettings.x == 0u)
 	{
-		vec3 outwardNormal;
-		float hitDistance = HitTriangle(
-			shadowRay,
-			u_TriangleBuffer.Triangles[triangleIndex],
-			outwardNormal);
-		if (hitDistance > 0.0 &&
-			hitDistance < maximumDistance - RAY_EPSILON)
+		for (uint triangleIndex = 0u;
+			triangleIndex < u_PushConstants.TriangleCount;
+			triangleIndex++)
 		{
-			return true;
+			vec3 outwardNormal;
+			float hitDistance = HitTriangle(
+				shadowRay,
+				u_TriangleBuffer.Triangles[triangleIndex],
+				outwardNormal);
+			if (hitDistance > 0.0 &&
+				hitDistance < maximumDistance - RAY_EPSILON)
+			{
+				return true;
+			}
+		}
+	}
+	else if (u_PushConstants.TriangleCount > 0u)
+	{
+		vec3 inverseDirection = SafeInverseDirection(shadowRay.Direction);
+		uint triangleNodeStack[BVH_STACK_SIZE];
+		int triangleStackSize = 0;
+		triangleNodeStack[triangleStackSize++] = 0u;
+
+		while (triangleStackSize > 0)
+		{
+			BvhNodeData node = u_TriangleBvhBuffer.Nodes[
+				triangleNodeStack[--triangleStackSize]];
+			if (!HitAabb(
+				shadowRay.Origin,
+				inverseDirection,
+				node.BoundsMin.xyz,
+				node.BoundsMax.xyz,
+				maximumDistance))
+			{
+				continue;
+			}
+
+			if (node.Links.z > 0u)
+			{
+				for (uint offset = 0u; offset < node.Links.z; offset++)
+				{
+					vec3 outwardNormal;
+					float hitDistance = HitTriangle(
+						shadowRay,
+						u_TriangleBuffer.Triangles[node.Links.x + offset],
+						outwardNormal);
+					if (hitDistance > 0.0 &&
+						hitDistance < maximumDistance - RAY_EPSILON)
+					{
+						return true;
+					}
+				}
+				continue;
+			}
+
+			if (triangleStackSize + 2 <= BVH_STACK_SIZE)
+			{
+				triangleNodeStack[triangleStackSize++] = node.Links.y;
+				triangleNodeStack[triangleStackSize++] = node.Links.x;
+			}
 		}
 	}
 

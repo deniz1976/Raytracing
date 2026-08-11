@@ -546,6 +546,10 @@ public:
 			m_Renderer.GetBvhNodeCount(),
 			m_Renderer.GetBvhDepth());
 		ImGui::Text(
+			"Triangle BVH nodes: %u (depth %u)",
+			m_Renderer.GetTriangleBvhNodeCount(),
+			m_Renderer.GetTriangleBvhDepth());
+		ImGui::Text(
 			"Estimated sphere tests per ray: %.2f",
 			m_Renderer.GetBvhCost());
 		ImGui::Text(
@@ -579,7 +583,9 @@ public:
 			"the wait for the display, so CPU render time stays near the frame "
 			"time even when the dispatch is much shorter.");
 		ImGui::TextWrapped(
-			"Turn the BVH off to compare the tree against testing every sphere. "
+			"Turn the BVH off to compare both trees against testing every sphere "
+			"and triangle. The triangle tree uses a balanced median split and up "
+			"to four triangles per leaf. "
 			"The split heuristic decides where each range of spheres is cut in "
 			"two: the surface area heuristic cuts where the two child boxes are "
 			"cheapest to trace, while the median split cuts where the sphere "
