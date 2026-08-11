@@ -1,4 +1,5 @@
-#version 450
+#version 460
+#extension GL_EXT_ray_query : require
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -80,6 +81,7 @@ layout(std430, set = 0, binding = 6) readonly buffer TriangleBvhBuffer
 
 layout(set = 0, binding = 7) uniform sampler2D u_ModelTexture;
 layout(set = 0, binding = 8) uniform sampler2D u_EnvironmentTexture;
+layout(set = 0, binding = 9) uniform accelerationStructureEXT u_TriangleTlas;
 
 layout(push_constant) uniform PushConstants
 {
@@ -94,6 +96,7 @@ layout(push_constant) uniform PushConstants
 	float EnvironmentIntensity;
 	float EnvironmentRotation;
 	uint HasEnvironmentMap;
+	uvec4 HardwareSettings;
 } u_PushConstants;
 
 const float RAY_EPSILON = 0.001;
@@ -683,6 +686,52 @@ bool IntersectSphereRange(
 	return hitAnything;
 }
 
+bool IntersectTrianglesRayQuery(Ray ray, inout HitRecord closestHit)
+{
+	rayQueryEXT query;
+	rayQueryInitializeEXT(
+		query,
+		u_TriangleTlas,
+		gl_RayFlagsOpaqueEXT,
+		0xff,
+		ray.Origin,
+		RAY_EPSILON,
+		ray.Direction,
+		closestHit.Distance);
+	while (rayQueryProceedEXT(query))
+	{
+	}
+	if (rayQueryGetIntersectionTypeEXT(query, true) ==
+		gl_RayQueryCommittedIntersectionNoneEXT)
+	{
+		return false;
+	}
+
+	uint triangleIndex = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+	vec3 geometricNormal;
+	vec3 shadingNormal;
+	vec3 textureTint;
+	float hitDistance = HitTriangle(
+		ray,
+		u_TriangleBuffer.Triangles[triangleIndex],
+		geometricNormal,
+		shadingNormal,
+		textureTint);
+	if (hitDistance <= 0.0 || hitDistance >= closestHit.Distance)
+		return false;
+
+	TriangleData triangle = u_TriangleBuffer.Triangles[triangleIndex];
+	closestHit.Distance = hitDistance;
+	closestHit.Position = ray.Origin + ray.Direction * hitDistance;
+	closestHit.FrontFace = dot(ray.Direction, geometricNormal) < 0.0;
+	closestHit.Normal = closestHit.FrontFace
+		? shadingNormal
+		: -shadingNormal;
+	closestHit.SurfaceMaterial = GetTriangleMaterial(triangle);
+	closestHit.SurfaceMaterial.Albedo *= textureTint;
+	return true;
+}
+
 bool TraceScene(
 	Ray ray,
 	out HitRecord closestHit)
@@ -746,7 +795,9 @@ bool TraceScene(
 
 	if (u_PushConstants.TriangleCount > 0u)
 	{
-		bool hitTriangles = u_PushConstants.SceneSettings.x == 0u
+		bool hitTriangles = u_PushConstants.HardwareSettings.x != 0u
+			? IntersectTrianglesRayQuery(ray, closestHit)
+			: u_PushConstants.SceneSettings.x == 0u
 			? IntersectTriangleRange(
 				ray,
 				0u,
@@ -769,8 +820,32 @@ bool IsOccluded(
 	Ray shadowRay;
 	shadowRay.Origin = surfacePosition + surfaceNormal * RAY_EPSILON;
 	shadowRay.Direction = directionToLight;
+	if (u_PushConstants.HardwareSettings.x != 0u &&
+		u_PushConstants.TriangleCount > 0u)
+	{
+		rayQueryEXT query;
+		rayQueryInitializeEXT(
+			query,
+			u_TriangleTlas,
+			gl_RayFlagsOpaqueEXT |
+				gl_RayFlagsTerminateOnFirstHitEXT,
+			0xff,
+			shadowRay.Origin,
+			RAY_EPSILON,
+			shadowRay.Direction,
+			maximumDistance - RAY_EPSILON);
+		while (rayQueryProceedEXT(query))
+		{
+		}
+		if (rayQueryGetIntersectionTypeEXT(query, true) !=
+			gl_RayQueryCommittedIntersectionNoneEXT)
+		{
+			return true;
+		}
+	}
 
-	if (u_PushConstants.SceneSettings.x == 0u)
+	if (u_PushConstants.HardwareSettings.x == 0u &&
+		u_PushConstants.SceneSettings.x == 0u)
 	{
 		for (uint triangleIndex = 0u;
 			triangleIndex < u_PushConstants.TriangleCount;
@@ -792,7 +867,8 @@ bool IsOccluded(
 			}
 		}
 	}
-	else if (u_PushConstants.TriangleCount > 0u)
+	else if (u_PushConstants.HardwareSettings.x == 0u &&
+		u_PushConstants.TriangleCount > 0u)
 	{
 		vec3 inverseDirection = SafeInverseDirection(shadowRay.Direction);
 		uint triangleNodeStack[BVH_STACK_SIZE];

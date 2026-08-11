@@ -171,6 +171,9 @@ public:
 	float GetCpuRenderTimeMs() const { return m_CpuRenderTimeMs; }
 	float GetGpuComputeTimeMs() const { return m_GpuComputeTimeMs; }
 	bool AreGpuTimestampsSupported() const { return m_TimestampQueryPool != VK_NULL_HANDLE; }
+	bool IsRayQuerySupported() const { return m_RayQuerySupported; }
+	bool IsRayQueryEnabled() const { return m_UseRayQuery; }
+	void SetRayQueryEnabled(bool enabled);
 
 private:
 	uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
@@ -200,6 +203,15 @@ private:
 	void UploadSceneBuffer();
 	void UploadLightBuffer();
 	void UploadTriangleBuffer();
+	void BuildTriangleAccelerationStructure();
+	void ReleaseTriangleAccelerationStructure();
+	VkDeviceAddress GetBufferDeviceAddress(VkBuffer buffer) const;
+	void CreateAddressBuffer(
+		VkDeviceSize size,
+		VkBufferUsageFlags usage,
+		VkMemoryPropertyFlags properties,
+		VkBuffer& buffer,
+		VkDeviceMemory& memory) const;
 	void BuildTriangleBvh();
 	void ApplyModelTransform();
 
@@ -264,6 +276,8 @@ private:
 	std::vector<SphereLight> m_Lights;
 
 	bool m_UseBvh = true;
+	bool m_RayQuerySupported = false;
+	bool m_UseRayQuery = false;
 	// Sampling one light per hit keeps the shadow ray cost independent of the
 	// light count, at the price of extra noise that accumulation removes. The
 	// light is chosen in proportion to its weight, which cut the noise by up to
@@ -320,6 +334,16 @@ private:
 	VkDescriptorSetLayout m_ComputeDescriptorSetLayout = VK_NULL_HANDLE;
 	VkDescriptorPool m_ComputeDescriptorPool = VK_NULL_HANDLE;
 	VkDescriptorSet m_ComputeDescriptorSet = VK_NULL_HANDLE;
+	VkBuffer m_RayQueryVertexBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_RayQueryVertexMemory = VK_NULL_HANDLE;
+	VkBuffer m_BlasBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_BlasMemory = VK_NULL_HANDLE;
+	VkAccelerationStructureKHR m_Blas = VK_NULL_HANDLE;
+	VkBuffer m_TlasBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_TlasMemory = VK_NULL_HANDLE;
+	VkAccelerationStructureKHR m_Tlas = VK_NULL_HANDLE;
+	VkBuffer m_TlasInstanceBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_TlasInstanceMemory = VK_NULL_HANDLE;
 
 	VkPipelineLayout m_ComputePipelineLayout = VK_NULL_HANDLE;
 	VkPipeline m_ComputePipeline = VK_NULL_HANDLE;

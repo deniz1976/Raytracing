@@ -31,7 +31,7 @@ project "WalnutApp"
    prebuildcommands
    {
       "{MKDIR} \"%{wks.location}/WalnutApp/assets/shaders\"",
-      "\"" .. VulkanSDK .. "/Bin/glslc.exe\" \"%{wks.location}/WalnutApp/src/Shaders/RayTracing.comp\" -o \"%{wks.location}/WalnutApp/assets/shaders/RayTracing.comp.spv\""
+      "\"" .. VulkanSDK .. "/Bin/glslc.exe\" --target-env=vulkan1.2 \"%{wks.location}/WalnutApp/src/Shaders/RayTracing.comp\" -o \"%{wks.location}/WalnutApp/assets/shaders/RayTracing.comp.spv\""
    }
 
    filter "system:windows"

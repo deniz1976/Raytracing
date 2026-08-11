@@ -26,6 +26,11 @@
 
 namespace
 {
+	PFN_vkCreateAccelerationStructureKHR s_CreateAccelerationStructure = nullptr;
+	PFN_vkDestroyAccelerationStructureKHR s_DestroyAccelerationStructure = nullptr;
+	PFN_vkCmdBuildAccelerationStructuresKHR s_CmdBuildAccelerationStructures = nullptr;
+	PFN_vkGetAccelerationStructureBuildSizesKHR s_GetAccelerationStructureBuildSizes = nullptr;
+	PFN_vkGetAccelerationStructureDeviceAddressKHR s_GetAccelerationStructureDeviceAddress = nullptr;
 	// SceneSettings.x is 1 when the BVH should be traversed, .y is the number of
 	// lights in the light buffer, .z is 1 when each hit samples a single light
 	// chosen by weight instead of all of them and .w is the bounce limit.
@@ -42,11 +47,12 @@ namespace
 		float EnvironmentIntensity;
 		float EnvironmentRotation;
 		uint32_t HasEnvironmentMap;
+		glm::uvec4 HardwareSettings;
 	};
 
 	// The triangle count grows this from 64 to 80 bytes, still leaving 48 bytes
 	// inside the 128-byte push constant capacity Vulkan guarantees.
-	static_assert(sizeof(PushConstants) == 80);
+	static_assert(sizeof(PushConstants) == 96);
 
 	struct alignas(16) GpuSphere
 	{
@@ -331,6 +337,34 @@ ComputeRenderer::~ComputeRenderer()
 
 void ComputeRenderer::Init(const std::string& shaderPath, uint32_t width, uint32_t height)
 {
+	m_RayQuerySupported = Walnut::Application::SupportsRayQuery();
+	if (!m_RayQuerySupported)
+		throw std::runtime_error(
+			"VK_KHR_ray_query and acceleration structures are required.");
+	VkDevice device = Walnut::Application::GetDevice();
+	s_CreateAccelerationStructure =
+		reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
+			vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR"));
+	s_DestroyAccelerationStructure =
+		reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>(
+			vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR"));
+	s_CmdBuildAccelerationStructures =
+		reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
+			vkGetDeviceProcAddr(device, "vkCmdBuildAccelerationStructuresKHR"));
+	s_GetAccelerationStructureBuildSizes =
+		reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(
+			vkGetDeviceProcAddr(device, "vkGetAccelerationStructureBuildSizesKHR"));
+	s_GetAccelerationStructureDeviceAddress =
+		reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
+			vkGetDeviceProcAddr(device, "vkGetAccelerationStructureDeviceAddressKHR"));
+	if (!s_CreateAccelerationStructure || !s_DestroyAccelerationStructure ||
+		!s_CmdBuildAccelerationStructures ||
+		!s_GetAccelerationStructureBuildSizes ||
+		!s_GetAccelerationStructureDeviceAddress)
+	{
+		throw std::runtime_error(
+			"Ray query acceleration structure functions could not be loaded.");
+	}
 	m_Width = width;
 	m_Height = height;
 	m_FrameIndex = 0;
@@ -1049,6 +1083,262 @@ void ComputeRenderer::UploadTriangleBuffer()
 		m_TriangleBufferMemory,
 		gpuTriangles.data(),
 		gpuTriangles.size() * sizeof(GpuTriangle));
+	BuildTriangleAccelerationStructure();
+}
+
+VkDeviceAddress ComputeRenderer::GetBufferDeviceAddress(VkBuffer buffer) const
+{
+	VkBufferDeviceAddressInfo addressInfo{};
+	addressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+	addressInfo.buffer = buffer;
+	return vkGetBufferDeviceAddress(
+		Walnut::Application::GetDevice(), &addressInfo);
+}
+
+void ComputeRenderer::CreateAddressBuffer(
+	VkDeviceSize size,
+	VkBufferUsageFlags usage,
+	VkMemoryPropertyFlags properties,
+	VkBuffer& buffer,
+	VkDeviceMemory& memory) const
+{
+	VkDevice device = Walnut::Application::GetDevice();
+	VkBufferCreateInfo bufferInfo{};
+	bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	bufferInfo.size = size;
+	bufferInfo.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+	check_vk_result(vkCreateBuffer(device, &bufferInfo, nullptr, &buffer));
+
+	VkMemoryRequirements requirements{};
+	vkGetBufferMemoryRequirements(device, buffer, &requirements);
+	VkMemoryAllocateFlagsInfo flagsInfo{};
+	flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+	flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+	VkMemoryAllocateInfo allocationInfo{};
+	allocationInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocationInfo.pNext = &flagsInfo;
+	allocationInfo.allocationSize = requirements.size;
+	allocationInfo.memoryTypeIndex = FindMemoryType(
+		requirements.memoryTypeBits, properties);
+	check_vk_result(vkAllocateMemory(device, &allocationInfo, nullptr, &memory));
+	check_vk_result(vkBindBufferMemory(device, buffer, memory, 0));
+}
+
+void ComputeRenderer::ReleaseTriangleAccelerationStructure()
+{
+	VkDevice device = Walnut::Application::GetDevice();
+	if (m_Tlas != VK_NULL_HANDLE)
+		s_DestroyAccelerationStructure(device, m_Tlas, nullptr);
+	if (m_Blas != VK_NULL_HANDLE)
+		s_DestroyAccelerationStructure(device, m_Blas, nullptr);
+	if (m_TlasBuffer != VK_NULL_HANDLE)
+		vkDestroyBuffer(device, m_TlasBuffer, nullptr);
+	if (m_TlasMemory != VK_NULL_HANDLE)
+		vkFreeMemory(device, m_TlasMemory, nullptr);
+	if (m_BlasBuffer != VK_NULL_HANDLE)
+		vkDestroyBuffer(device, m_BlasBuffer, nullptr);
+	if (m_BlasMemory != VK_NULL_HANDLE)
+		vkFreeMemory(device, m_BlasMemory, nullptr);
+	if (m_TlasInstanceBuffer != VK_NULL_HANDLE)
+		vkDestroyBuffer(device, m_TlasInstanceBuffer, nullptr);
+	if (m_TlasInstanceMemory != VK_NULL_HANDLE)
+		vkFreeMemory(device, m_TlasInstanceMemory, nullptr);
+	if (m_RayQueryVertexBuffer != VK_NULL_HANDLE)
+		vkDestroyBuffer(device, m_RayQueryVertexBuffer, nullptr);
+	if (m_RayQueryVertexMemory != VK_NULL_HANDLE)
+		vkFreeMemory(device, m_RayQueryVertexMemory, nullptr);
+	m_Tlas = VK_NULL_HANDLE;
+	m_Blas = VK_NULL_HANDLE;
+	m_TlasBuffer = VK_NULL_HANDLE;
+	m_TlasMemory = VK_NULL_HANDLE;
+	m_BlasBuffer = VK_NULL_HANDLE;
+	m_BlasMemory = VK_NULL_HANDLE;
+	m_TlasInstanceBuffer = VK_NULL_HANDLE;
+	m_TlasInstanceMemory = VK_NULL_HANDLE;
+	m_RayQueryVertexBuffer = VK_NULL_HANDLE;
+	m_RayQueryVertexMemory = VK_NULL_HANDLE;
+}
+
+void ComputeRenderer::BuildTriangleAccelerationStructure()
+{
+	if (!m_RayQuerySupported || m_Triangles.empty())
+		return;
+
+	VkDevice device = Walnut::Application::GetDevice();
+	check_vk_result(vkDeviceWaitIdle(device));
+	ReleaseTriangleAccelerationStructure();
+
+	std::vector<glm::vec3> vertices;
+	vertices.reserve(m_Triangles.size() * 3);
+	for (uint32_t orderedIndex : m_TriangleOrder)
+	{
+		const Triangle& triangle = m_Triangles[orderedIndex];
+		vertices.push_back(triangle.Vertex0);
+		vertices.push_back(triangle.Vertex1);
+		vertices.push_back(triangle.Vertex2);
+	}
+	CreateAddressBuffer(
+		vertices.size() * sizeof(glm::vec3),
+		VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+			VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		m_RayQueryVertexBuffer,
+		m_RayQueryVertexMemory);
+	WriteHostBuffer(
+		m_RayQueryVertexMemory, vertices.data(),
+		vertices.size() * sizeof(glm::vec3));
+
+	VkAccelerationStructureGeometryKHR geometry{};
+	geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+	geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+	geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+	geometry.geometry.triangles.sType =
+		VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+	geometry.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+	geometry.geometry.triangles.vertexData.deviceAddress =
+		GetBufferDeviceAddress(m_RayQueryVertexBuffer);
+	geometry.geometry.triangles.vertexStride = sizeof(glm::vec3);
+	geometry.geometry.triangles.maxVertex =
+		static_cast<uint32_t>(vertices.size() - 1);
+	geometry.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+
+	const uint32_t primitiveCount = GetTriangleCount();
+	VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+	buildInfo.sType =
+		VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+	buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+	buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+	buildInfo.geometryCount = 1;
+	buildInfo.pGeometries = &geometry;
+	VkAccelerationStructureBuildSizesInfoKHR sizeInfo{};
+	sizeInfo.sType =
+		VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+	s_GetAccelerationStructureBuildSizes(
+		device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+		&buildInfo, &primitiveCount, &sizeInfo);
+	CreateAddressBuffer(
+		sizeInfo.accelerationStructureSize,
+		VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		m_BlasBuffer, m_BlasMemory);
+	VkAccelerationStructureCreateInfoKHR createInfo{};
+	createInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+	createInfo.buffer = m_BlasBuffer;
+	createInfo.size = sizeInfo.accelerationStructureSize;
+	createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+	check_vk_result(s_CreateAccelerationStructure(
+		device, &createInfo, nullptr, &m_Blas));
+	VkBuffer scratchBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory scratchMemory = VK_NULL_HANDLE;
+	CreateAddressBuffer(
+		sizeInfo.buildScratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, scratchBuffer, scratchMemory);
+	buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+	buildInfo.dstAccelerationStructure = m_Blas;
+	buildInfo.scratchData.deviceAddress = GetBufferDeviceAddress(scratchBuffer);
+	VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
+	rangeInfo.primitiveCount = primitiveCount;
+	const VkAccelerationStructureBuildRangeInfoKHR* rangeInfos[] = { &rangeInfo };
+	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
+	s_CmdBuildAccelerationStructures(
+		commandBuffer, 1, &buildInfo, rangeInfos);
+	Walnut::Application::FlushCommandBuffer(commandBuffer);
+	vkDestroyBuffer(device, scratchBuffer, nullptr);
+	vkFreeMemory(device, scratchMemory, nullptr);
+
+	VkAccelerationStructureDeviceAddressInfoKHR blasAddressInfo{};
+	blasAddressInfo.sType =
+		VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+	blasAddressInfo.accelerationStructure = m_Blas;
+	VkAccelerationStructureInstanceKHR instance{};
+	instance.transform.matrix[0][0] = 1.0f;
+	instance.transform.matrix[1][1] = 1.0f;
+	instance.transform.matrix[2][2] = 1.0f;
+	instance.mask = 0xff;
+	instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+	instance.accelerationStructureReference =
+		s_GetAccelerationStructureDeviceAddress(device, &blasAddressInfo);
+	CreateAddressBuffer(
+		sizeof(instance),
+		VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+			VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		m_TlasInstanceBuffer, m_TlasInstanceMemory);
+	WriteHostBuffer(m_TlasInstanceMemory, &instance, sizeof(instance));
+
+	VkAccelerationStructureGeometryKHR instanceGeometry{};
+	instanceGeometry.sType =
+		VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+	instanceGeometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+	instanceGeometry.geometry.instances.sType =
+		VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+	instanceGeometry.geometry.instances.data.deviceAddress =
+		GetBufferDeviceAddress(m_TlasInstanceBuffer);
+	VkAccelerationStructureBuildGeometryInfoKHR tlasBuildInfo{};
+	tlasBuildInfo.sType =
+		VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+	tlasBuildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+	tlasBuildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+	tlasBuildInfo.geometryCount = 1;
+	tlasBuildInfo.pGeometries = &instanceGeometry;
+	const uint32_t instanceCount = 1;
+	VkAccelerationStructureBuildSizesInfoKHR tlasSizeInfo{};
+	tlasSizeInfo.sType =
+		VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+	s_GetAccelerationStructureBuildSizes(
+		device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+		&tlasBuildInfo, &instanceCount, &tlasSizeInfo);
+	CreateAddressBuffer(
+		tlasSizeInfo.accelerationStructureSize,
+		VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		m_TlasBuffer, m_TlasMemory);
+	createInfo.buffer = m_TlasBuffer;
+	createInfo.size = tlasSizeInfo.accelerationStructureSize;
+	createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+	check_vk_result(s_CreateAccelerationStructure(
+		device, &createInfo, nullptr, &m_Tlas));
+	CreateAddressBuffer(
+		tlasSizeInfo.buildScratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, scratchBuffer, scratchMemory);
+	tlasBuildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+	tlasBuildInfo.dstAccelerationStructure = m_Tlas;
+	tlasBuildInfo.scratchData.deviceAddress = GetBufferDeviceAddress(scratchBuffer);
+	VkAccelerationStructureBuildRangeInfoKHR tlasRangeInfo{};
+	tlasRangeInfo.primitiveCount = 1;
+	const VkAccelerationStructureBuildRangeInfoKHR* tlasRanges[] = { &tlasRangeInfo };
+	commandBuffer = Walnut::Application::GetCommandBuffer(true);
+	s_CmdBuildAccelerationStructures(
+		commandBuffer, 1, &tlasBuildInfo, tlasRanges);
+	Walnut::Application::FlushCommandBuffer(commandBuffer);
+	vkDestroyBuffer(device, scratchBuffer, nullptr);
+	vkFreeMemory(device, scratchMemory, nullptr);
+
+	if (m_ComputeDescriptorSet != VK_NULL_HANDLE)
+	{
+		VkWriteDescriptorSetAccelerationStructureKHR accelerationInfo{};
+		accelerationInfo.sType =
+			VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+		accelerationInfo.accelerationStructureCount = 1;
+		accelerationInfo.pAccelerationStructures = &m_Tlas;
+		VkWriteDescriptorSet descriptorWrite{};
+		descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		descriptorWrite.pNext = &accelerationInfo;
+		descriptorWrite.dstSet = m_ComputeDescriptorSet;
+		descriptorWrite.dstBinding = 9;
+		descriptorWrite.descriptorCount = 1;
+		descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+		vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+	}
+}
+
+void ComputeRenderer::SetRayQueryEnabled(bool enabled)
+{
+	const bool supportedValue = enabled && m_RayQuerySupported;
+	if (m_UseRayQuery == supportedValue)
+		return;
+	m_UseRayQuery = supportedValue;
+	ResetAccumulation();
 }
 
 void ComputeRenderer::BuildTriangleBvh()
@@ -2535,7 +2825,7 @@ void ComputeRenderer::CreateComputeDescriptors()
 {
 	VkDevice device = Walnut::Application::GetDevice();
 
-	VkDescriptorSetLayoutBinding descriptorBindings[9]{};
+	VkDescriptorSetLayoutBinding descriptorBindings[10]{};
 	for (uint32_t bindingIndex = 0; bindingIndex < 2; bindingIndex++)
 	{
 		descriptorBindings[bindingIndex].binding = bindingIndex;
@@ -2557,26 +2847,33 @@ void ComputeRenderer::CreateComputeDescriptors()
 	descriptorBindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 	descriptorBindings[8] = descriptorBindings[7];
 	descriptorBindings[8].binding = 8;
+	descriptorBindings[9].binding = 9;
+	descriptorBindings[9].descriptorType =
+		VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	descriptorBindings[9].descriptorCount = 1;
+	descriptorBindings[9].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 9;
+	layoutInfo.bindingCount = 10;
 	layoutInfo.pBindings = descriptorBindings;
 	check_vk_result(vkCreateDescriptorSetLayout(
 		device, &layoutInfo, nullptr, &m_ComputeDescriptorSetLayout));
 
-	VkDescriptorPoolSize poolSizes[3]{};
+	VkDescriptorPoolSize poolSizes[4]{};
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	poolSizes[0].descriptorCount = 2;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	poolSizes[1].descriptorCount = 5;
 	poolSizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	poolSizes[2].descriptorCount = 2;
+	poolSizes[3].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	poolSizes[3].descriptorCount = 1;
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.maxSets = 1;
-	poolInfo.poolSizeCount = 3;
+	poolInfo.poolSizeCount = 4;
 	poolInfo.pPoolSizes = poolSizes;
 	check_vk_result(vkCreateDescriptorPool(
 		device, &poolInfo, nullptr, &m_ComputeDescriptorPool));
@@ -2633,6 +2930,20 @@ void ComputeRenderer::CreateComputeDescriptors()
 	vkUpdateDescriptorSets(device, 7, descriptorWrites, 0, nullptr);
 	UpdateTextureDescriptor();
 	UpdateEnvironmentDescriptor();
+	VkWriteDescriptorSetAccelerationStructureKHR accelerationInfo{};
+	accelerationInfo.sType =
+		VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+	accelerationInfo.accelerationStructureCount = 1;
+	accelerationInfo.pAccelerationStructures = &m_Tlas;
+	VkWriteDescriptorSet accelerationWrite{};
+	accelerationWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	accelerationWrite.pNext = &accelerationInfo;
+	accelerationWrite.dstSet = m_ComputeDescriptorSet;
+	accelerationWrite.dstBinding = 9;
+	accelerationWrite.descriptorCount = 1;
+	accelerationWrite.descriptorType =
+		VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	vkUpdateDescriptorSets(device, 1, &accelerationWrite, 0, nullptr);
 }
 
 void ComputeRenderer::UpdateTextureDescriptor()
@@ -2753,6 +3064,8 @@ void ComputeRenderer::Render()
 	pushConstants.EnvironmentIntensity = m_EnvironmentIntensity;
 	pushConstants.EnvironmentRotation = glm::radians(m_EnvironmentRotation);
 	pushConstants.HasEnvironmentMap = m_HasEnvironmentMap ? 1u : 0u;
+	pushConstants.HardwareSettings = glm::uvec4(
+		m_UseRayQuery ? 1u : 0u, 0u, 0u, 0u);
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
@@ -2863,6 +3176,8 @@ void ComputeRenderer::Release()
 {
 	if (m_OutputImage == VK_NULL_HANDLE)
 		return;
+	check_vk_result(vkDeviceWaitIdle(Walnut::Application::GetDevice()));
+	ReleaseTriangleAccelerationStructure();
 
 	VkPipeline pipeline = m_ComputePipeline;
 	VkPipelineLayout pipelineLayout = m_ComputePipelineLayout;

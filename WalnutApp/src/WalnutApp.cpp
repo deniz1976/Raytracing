@@ -616,6 +616,21 @@ public:
 		if (ImGui::Checkbox("Use BVH", &bvhEnabled))
 			m_Renderer.SetBvhEnabled(bvhEnabled);
 
+		bool rayQueryEnabled = m_Renderer.IsRayQueryEnabled();
+		if (m_Renderer.IsRayQuerySupported())
+		{
+			if (ImGui::Checkbox(
+				"Use RTX ray query for triangles", &rayQueryEnabled))
+				m_Renderer.SetRayQueryEnabled(rayQueryEnabled);
+		}
+		else
+		{
+			ImGui::Text("VK_KHR_ray_query: unsupported");
+		}
+		ImGui::TextWrapped(
+			"This toggle compares the custom compute BVH with hardware triangle "
+			"traversal. Analytic spheres still use the custom sphere BVH.");
+
 		bool sahSplitEnabled = m_Renderer.IsSahSplitEnabled();
 		// Same reasoning as the BVH toggle: a different split rearranges the tree
 		// but cannot change which sphere a ray meets first, so the samples stand.

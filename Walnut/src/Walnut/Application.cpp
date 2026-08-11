@@ -15,6 +15,8 @@
 #include <glm/glm.hpp>
 
 #include <iostream>
+#include <array>
+#include <cstring>
 
 // Emedded font
 #include "ImGui/Roboto-Regular.embed"
@@ -46,6 +48,7 @@ static VkDescriptorPool         g_DescriptorPool = VK_NULL_HANDLE;
 static ImGui_ImplVulkanH_Window g_MainWindowData;
 static int                      g_MinImageCount = 2;
 static bool                     g_SwapChainRebuild = false;
+static bool                     g_RayQuerySupported = false;
 
 // Per-frame-in-flight
 static std::vector<std::vector<VkCommandBuffer>> s_AllocatedCommandBuffers;
@@ -81,8 +84,13 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 
 	// Create Vulkan Instance
 	{
+		VkApplicationInfo application_info = {};
+		application_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+		application_info.pApplicationName = "Walnut Ray Tracer";
+		application_info.apiVersion = VK_API_VERSION_1_2;
 		VkInstanceCreateInfo create_info = {};
 		create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+		create_info.pApplicationInfo = &application_info;
 		create_info.enabledExtensionCount = extensions_count;
 		create_info.ppEnabledExtensionNames = extensions;
 #ifdef IMGUI_VULKAN_DEBUG_REPORT
@@ -172,8 +180,60 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 
 	// Create Logical Device (with 1 queue)
 	{
-		int device_extension_count = 1;
-		const char* device_extensions[] = { "VK_KHR_swapchain" };
+		constexpr std::array<const char*, 7> ray_query_extensions = {
+			VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+			VK_KHR_RAY_QUERY_EXTENSION_NAME,
+			VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+			VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+			VK_KHR_SPIRV_1_4_EXTENSION_NAME,
+			VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
+			VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME
+		};
+		uint32_t available_extension_count = 0;
+		vkEnumerateDeviceExtensionProperties(
+			g_PhysicalDevice, nullptr, &available_extension_count, nullptr);
+		std::vector<VkExtensionProperties> available_extensions(
+			available_extension_count);
+		vkEnumerateDeviceExtensionProperties(
+			g_PhysicalDevice, nullptr, &available_extension_count,
+			available_extensions.data());
+		g_RayQuerySupported = true;
+		for (const char* required_extension : ray_query_extensions)
+		{
+			bool found = false;
+			for (const VkExtensionProperties& available : available_extensions)
+				if (strcmp(required_extension, available.extensionName) == 0)
+					found = true;
+			g_RayQuerySupported &= found;
+		}
+
+		VkPhysicalDeviceBufferDeviceAddressFeatures buffer_address_features{};
+		buffer_address_features.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+		VkPhysicalDeviceAccelerationStructureFeaturesKHR acceleration_features{};
+		acceleration_features.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+		acceleration_features.pNext = &buffer_address_features;
+		VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features{};
+		ray_query_features.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+		ray_query_features.pNext = &acceleration_features;
+		VkPhysicalDeviceFeatures2 device_features{};
+		device_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+		device_features.pNext = &ray_query_features;
+		vkGetPhysicalDeviceFeatures2(g_PhysicalDevice, &device_features);
+		g_RayQuerySupported &= ray_query_features.rayQuery == VK_TRUE;
+		g_RayQuerySupported &=
+			acceleration_features.accelerationStructure == VK_TRUE;
+		g_RayQuerySupported &=
+			buffer_address_features.bufferDeviceAddress == VK_TRUE;
+
+		std::vector<const char*> device_extensions = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+		if (g_RayQuerySupported)
+			device_extensions.insert(
+				device_extensions.end(),
+				ray_query_extensions.begin(),
+				ray_query_extensions.end());
 		const float queue_priority[] = { 1.0f };
 		VkDeviceQueueCreateInfo queue_info[1] = {};
 		queue_info[0].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -184,8 +244,10 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		create_info.queueCreateInfoCount = sizeof(queue_info) / sizeof(queue_info[0]);
 		create_info.pQueueCreateInfos = queue_info;
-		create_info.enabledExtensionCount = device_extension_count;
-		create_info.ppEnabledExtensionNames = device_extensions;
+		create_info.enabledExtensionCount =
+			static_cast<uint32_t>(device_extensions.size());
+		create_info.ppEnabledExtensionNames = device_extensions.data();
+		create_info.pNext = g_RayQuerySupported ? &ray_query_features : nullptr;
 		err = vkCreateDevice(g_PhysicalDevice, &create_info, g_Allocator, &g_Device);
 		check_vk_result(err);
 		vkGetDeviceQueue(g_Device, g_QueueFamily, 0, &g_Queue);
@@ -712,6 +774,11 @@ namespace Walnut {
 	uint32_t Application::GetQueueFamily()
 	{
 		return g_QueueFamily;
+	}
+
+	bool Application::SupportsRayQuery()
+	{
+		return g_RayQuerySupported;
 	}
 
 	VkCommandBuffer Application::GetCommandBuffer(bool begin)

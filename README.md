@@ -2,8 +2,8 @@
 
 A learning-focused GPU path tracer built on the
 [Walnut](https://github.com/StudioCherno/Walnut) application framework. Rays are
-generated, intersected and shaded in a Vulkan compute shader; Vulkan ray tracing
-pipeline extensions are not required.
+generated and shaded in a Vulkan compute shader. Triangle traversal can be switched
+between a custom shader BVH and `VK_KHR_ray_query` hardware traversal.
 
 The default render starts at 1600 x 900 and then follows the live ImGui viewport.
 
@@ -20,18 +20,21 @@ The default render starts at 1600 x 900 and then follows the live ImGui viewport
 - Scene save/load with backward-compatible format versions
 - Free-look camera and live scene, light, render and performance panels
 - CPU timings, Vulkan timestamp-based GPU timings and BVH statistics
+- Live custom triangle BVH versus RTX ray-query traversal comparison
 
 ## Requirements
 
 - Windows 10 or 11
-- A Vulkan-capable GPU and current graphics driver
+- A GPU and driver with Vulkan 1.2, `VK_KHR_ray_query` and
+  `VK_KHR_acceleration_structure` support
 - Visual Studio 2022 or newer with **Desktop development with C++**
 - [Vulkan SDK](https://vulkan.lunarg.com/sdk/home/windows) with the
   `VULKAN_SDK` environment variable set
 - Git submodules cloned (`--recursive`)
 
-The project is developed on an NVIDIA RTX 3050, but it uses standard Vulkan compute
-functionality rather than vendor-specific RTX instructions.
+The project is developed and validated on an NVIDIA RTX 3050. Ray query is a standard
+Vulkan extension rather than an NVIDIA-only API, but compatible ray-tracing hardware
+and drivers are required by this experimental version.
 
 ## Setup, Build and Run
 
@@ -69,7 +72,8 @@ build.
 
 The panels can add/remove spheres and spherical lights, edit materials, change camera
 and render settings, load OBJ and HDR files, transform a model, save/load the scene,
-and compare BVH or light sampling strategies.
+and compare custom BVH, hardware ray query or light sampling strategies. The ray-query
+toggle accelerates triangles; analytic spheres continue to use the custom sphere BVH.
 
 ## Asset Notes
 
@@ -112,8 +116,9 @@ and compare BVH or light sampling strategies.
 
 This is an educational renderer, not a production DCC renderer. Notable deliberate
 limits include one loaded OBJ model, one diffuse model texture, no texture mipmaps,
-no environment importance sampling and no hardware ray tracing pipeline. The sphere
-and triangle BVHs are built on the CPU and traversed in the compute shader.
+no environment importance sampling and no `VK_KHR_ray_tracing_pipeline` shader stages.
+The sphere and triangle BVHs are built on the CPU; the triangle path can instead build
+a Vulkan BLAS/TLAS and traverse it from the same compute shader with ray queries.
 
 ## Third Party
 
