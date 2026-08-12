@@ -53,12 +53,12 @@ public:
 		glm::vec3 Normal0{ 0.0f };
 		glm::vec3 Normal1{ 0.0f };
 		glm::vec3 Normal2{ 0.0f };
-		bool HasVertexNormals = false;
+		uint32_t HasVertexNormals = 0;
 		glm::vec2 TexCoord0{ 0.0f };
 		glm::vec2 TexCoord1{ 0.0f };
 		glm::vec2 TexCoord2{ 0.0f };
-		bool HasTexCoords = false;
-		bool UsesImageTexture = false;
+		uint32_t HasTexCoords = 0;
+		uint32_t UsesImageTexture = 0;
 	};
 
 	struct ModelTransform
@@ -100,6 +100,11 @@ public:
 	static constexpr uint32_t MinBounceCount = 1;
 	static constexpr uint32_t MaxBounceCount = 10;
 
+	ComputeRenderer() = default;
+	ComputeRenderer(const ComputeRenderer&) = delete;
+	ComputeRenderer& operator=(const ComputeRenderer&) = delete;
+	ComputeRenderer(ComputeRenderer&&) = delete;
+	ComputeRenderer& operator=(ComputeRenderer&&) = delete;
 	~ComputeRenderer();
 
 	void Init(const std::string& shaderPath, uint32_t width, uint32_t height);
@@ -125,6 +130,7 @@ public:
 	void SetEnvironmentIntensity(float intensity);
 	float GetEnvironmentRotation() const { return m_EnvironmentRotation; }
 	void SetEnvironmentRotation(float rotationDegrees);
+	const std::string& GetEnvironmentPath() const { return m_EnvironmentPath; }
 	const std::string& GetModelPath() const { return m_ModelPath; }
 	const ModelTransform& GetModelTransform() const { return m_ModelTransform; }
 	void SetModelTransform(const ModelTransform& transform);
@@ -157,11 +163,23 @@ public:
 	uint32_t GetWidth() const { return m_Width; }
 	uint32_t GetHeight() const { return m_Height; }
 	uint32_t GetFrameIndex() const { return m_FrameIndex; }
-	uint32_t GetSphereCount() const { return static_cast<uint32_t>(m_Spheres.size()); }
-	uint32_t GetTriangleCount() const { return static_cast<uint32_t>(m_Triangles.size()); }
+	uint32_t GetSphereCount() const
+	{
+		return static_cast<uint32_t>(m_Spheres.size() > MaxSphereCount
+			? MaxSphereCount : m_Spheres.size());
+	}
+	uint32_t GetTriangleCount() const
+	{
+		return static_cast<uint32_t>(m_Triangles.size() > MaxTriangleCount
+			? MaxTriangleCount : m_Triangles.size());
+	}
 	uint32_t GetTriangleBvhNodeCount() const { return m_TriangleBvhNodeCount; }
 	uint32_t GetTriangleBvhDepth() const { return m_TriangleBvhDepth; }
-	uint32_t GetLightCount() const { return static_cast<uint32_t>(m_Lights.size()); }
+	uint32_t GetLightCount() const
+	{
+		return static_cast<uint32_t>(m_Lights.size() > MaxLightCount
+			? MaxLightCount : m_Lights.size());
+	}
 	uint32_t GetBvhNodeCount() const { return m_BvhNodeCount; }
 	uint32_t GetBvhDepth() const { return m_BvhDepth; }
 	// The expected number of sphere tests one random ray costs, under the same
@@ -267,6 +285,7 @@ private:
 	std::string m_ModelPath;
 	std::unique_ptr<Walnut::Image> m_TextureImage;
 	std::unique_ptr<Walnut::Image> m_EnvironmentImage;
+	std::string m_EnvironmentPath;
 	bool m_HasEnvironmentMap = false;
 	float m_EnvironmentIntensity = 1.0f;
 	float m_EnvironmentRotation = 0.0f;

@@ -50,14 +50,14 @@ public:
 
 	virtual void OnUpdate(float timeStep) override
 	{
+		bool rightDown = Walnut::Input::IsMouseButtonDown(Walnut::MouseButton::Right);
+		if (rightDown && !ImGui::GetIO().WantCaptureMouse)
+			SetMouseLookEnabled(true);
+		else if (!rightDown)
+			SetMouseLookEnabled(false);
+
 		if (!m_MouseLookEnabled)
 			return;
-
-		if (Walnut::Input::IsKeyDown(Walnut::KeyCode::Escape))
-		{
-			SetMouseLookEnabled(false);
-			return;
-		}
 
 		bool cameraChanged = false;
 		ComputeRenderer::Camera camera = m_Renderer.GetCamera();
@@ -183,15 +183,8 @@ public:
 			&m_CameraMoveSpeed,
 			0.5f,
 			15.0f);
-		if (ImGui::Button(
-			m_MouseLookEnabled
-				? "Disable Mouse Look"
-				: "Enable Mouse Look"))
-		{
-			SetMouseLookEnabled(!m_MouseLookEnabled);
-		}
 		ImGui::TextWrapped(
-			"WASD: Move | Q/E: Down/Up | Mouse: Look | Esc: Release");
+			"WASD: Move | Q/E: Down/Up | Right Click: Look");
 
 		if (cameraChanged)
 			m_Renderer.SetCamera(camera);
@@ -220,6 +213,15 @@ public:
 					loadedModelPath.data(),
 					std::min(loadedModelPath.size(), m_ObjPath.size() - 1),
 					m_ObjPath.data());
+				m_EnvironmentPath.fill('\0');
+				const std::string& loadedEnvironmentPath =
+					m_Renderer.GetEnvironmentPath();
+				std::copy_n(
+					loadedEnvironmentPath.data(),
+					std::min(
+						loadedEnvironmentPath.size(),
+						m_EnvironmentPath.size() - 1),
+					m_EnvironmentPath.data());
 				const uint32_t loadedSphereCount = m_Renderer.GetSphereCount();
 				if (loadedSphereCount == 0)
 					m_SelectedSphereIndex = 0;
@@ -720,11 +722,6 @@ private:
 
 		m_MouseLookEnabled = enabled;
 		m_HasMousePosition = false;
-		ImGuiIO& io = ImGui::GetIO();
-		if (enabled)
-			io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
-		else
-			io.ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
 		Walnut::Input::SetCursorMode(
 			enabled
 				? Walnut::CursorMode::Locked

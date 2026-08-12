@@ -157,7 +157,7 @@ namespace
 			Max = glm::max(Max, other.Max);
 		}
 
-		bool IsEmpty() const { return Min.x > Max.x; }
+		bool IsEmpty() const { return Min.x > Max.x || Min.y > Max.y || Min.z > Max.z; }
 
 		// The chance that a random ray crossing the parent box also crosses this
 		// one is the ratio of their surface areas, which is why surface area and
@@ -211,13 +211,19 @@ namespace
 		const ComputeRenderer::Sphere& sphere)
 	{
 		ComputeRenderer::Sphere result = sphere;
+		result.Radius = std::isfinite(result.Radius) ? result.Radius : 0.5f;
 		result.Radius = std::clamp(result.Radius, 0.05f, 200.0f);
+		result.Albedo.r = std::isfinite(result.Albedo.r) ? result.Albedo.r : 0.8f;
+		result.Albedo.g = std::isfinite(result.Albedo.g) ? result.Albedo.g : 0.8f;
+		result.Albedo.b = std::isfinite(result.Albedo.b) ? result.Albedo.b : 0.8f;
 		result.Albedo = glm::clamp(
 			result.Albedo,
 			glm::vec3(0.0f),
 			glm::vec3(1.0f));
+		result.Reflectivity = std::isfinite(result.Reflectivity) ? result.Reflectivity : 0.0f;
 		result.Reflectivity =
 			std::clamp(result.Reflectivity, 0.0f, 1.0f);
+		result.Roughness = std::isfinite(result.Roughness) ? result.Roughness : 0.5f;
 		result.Roughness =
 			std::clamp(result.Roughness, 0.0f, 1.0f);
 		result.IndexOfRefraction = std::isfinite(result.IndexOfRefraction)
@@ -237,11 +243,16 @@ namespace
 		const ComputeRenderer::SphereLight& light)
 	{
 		ComputeRenderer::SphereLight result = light;
+		result.Color.r = std::isfinite(result.Color.r) ? result.Color.r : 1.0f;
+		result.Color.g = std::isfinite(result.Color.g) ? result.Color.g : 1.0f;
+		result.Color.b = std::isfinite(result.Color.b) ? result.Color.b : 1.0f;
 		result.Color = glm::clamp(
 			result.Color,
 			glm::vec3(0.0f),
 			glm::vec3(1.0f));
+		result.Radius = std::isfinite(result.Radius) ? result.Radius : 0.5f;
 		result.Radius = std::clamp(result.Radius, 0.05f, 20.0f);
+		result.Intensity = std::isfinite(result.Intensity) ? result.Intensity : 1.0f;
 		result.Intensity = std::clamp(result.Intensity, 0.0f, 100.0f);
 		return result;
 	}
@@ -254,7 +265,9 @@ namespace
 		const ComputeRenderer::Camera& camera)
 	{
 		ComputeRenderer::Camera result = camera;
+		result.Pitch = std::isfinite(result.Pitch) ? result.Pitch : 0.0f;
 		result.Pitch = std::clamp(result.Pitch, -89.0f, 89.0f);
+		result.VerticalFov = std::isfinite(result.VerticalFov) ? result.VerticalFov : 45.0f;
 		result.VerticalFov = std::clamp(result.VerticalFov, 20.0f, 90.0f);
 		return result;
 	}
@@ -322,15 +335,16 @@ namespace
 	{
 		std::ifstream file(path, std::ios::ate | std::ios::binary);
 		if (!file)
-			throw std::runtime_error("Compute shader could not be opened: " + path);
+			return {};
 
 		const size_t fileSize = static_cast<size_t>(file.tellg());
 		if (fileSize == 0 || fileSize % sizeof(uint32_t) != 0)
-			throw std::runtime_error("Compute shader contains invalid SPIR-V data: " + path);
+			return {};
 
 		std::vector<uint32_t> code(fileSize / sizeof(uint32_t));
 		file.seekg(0);
-		file.read(reinterpret_cast<char*>(code.data()), static_cast<std::streamsize>(fileSize));
+		if (!file.read(reinterpret_cast<char*>(code.data()), static_cast<std::streamsize>(fileSize)))
+			return {};
 		return code;
 	}
 }
@@ -472,11 +486,10 @@ void ComputeRenderer::ReadGpuComputeTime()
 
 	const uint64_t begin = timestamps[0] & m_TimestampValidMask;
 	const uint64_t end = timestamps[1] & m_TimestampValidMask;
-	if (end < begin)
-		return;
+	const uint64_t elapsed = (end - begin) & m_TimestampValidMask;
 
 	const float elapsedMs =
-		static_cast<float>(end - begin) * m_TimestampPeriodNs / 1000000.0f;
+		static_cast<float>(elapsed) * m_TimestampPeriodNs / 1000000.0f;
 	m_GpuComputeTimeMs = SmoothTiming(m_GpuComputeTimeMs, elapsedMs);
 }
 
@@ -1021,8 +1034,9 @@ void ComputeRenderer::UploadLightBuffer()
 		// ahead of time. Distance, incidence angle and visibility are properties
 		// of the shading point, so they cannot appear here; this is a bound on
 		// the light rather than its actual contribution.
+		const float samplingRadius = std::max(light.Radius, 0.01f);
 		weights[lightIndex] =
-			light.Intensity * light.Radius * light.Radius *
+			light.Intensity * samplingRadius * samplingRadius *
 			(light.Color.r + light.Color.g + light.Color.b);
 		totalWeight += weights[lightIndex];
 	}
@@ -1618,6 +1632,7 @@ bool ComputeRenderer::LoadObj(
 				if (materialCommand == "newmtl")
 				{
 					materialStream >> materialName;
+					materialAlbedos[materialName] = glm::vec3(1.0f);
 				}
 				else if (materialCommand == "Kd" && !materialName.empty())
 				{
@@ -1639,6 +1654,7 @@ bool ComputeRenderer::LoadObj(
 				{
 					std::string textureName;
 					std::getline(materialStream >> std::ws, textureName);
+					if (!textureName.empty() && textureName.back() == '\r') textureName.pop_back();
 					if (textureName.empty())
 					{
 						errorMessage = "MTL diffuse texture path is empty.";
@@ -1715,9 +1731,13 @@ bool ComputeRenderer::LoadObj(
 
 			// Positive OBJ indices start at one. Negative indices are relative to
 			// the end of the vertex list, with -1 naming the newest vertex.
-			const int64_t resolvedIndex = objIndex > 0
-				? objIndex - 1
-				: static_cast<int64_t>(vertices.size()) + objIndex;
+			int64_t resolvedIndex = objIndex;
+			if (resolvedIndex < 0) {
+				resolvedIndex = static_cast<int64_t>(vertices.size()) + resolvedIndex;
+			} else if (resolvedIndex > 0) {
+				resolvedIndex = resolvedIndex - 1;
+			}
+
 			if (objIndex == 0 || resolvedIndex < 0 ||
 				resolvedIndex >= static_cast<int64_t>(vertices.size()))
 			{
@@ -1754,9 +1774,13 @@ bool ComputeRenderer::LoadObj(
 						std::to_string(lineNumber) + ".";
 					return false;
 				}
-				const int64_t resolvedTextureIndex = textureObjIndex > 0
-					? textureObjIndex - 1
-					: static_cast<int64_t>(texCoords.size()) + textureObjIndex;
+				int64_t resolvedTextureIndex = textureObjIndex;
+				if (resolvedTextureIndex < 0) {
+					resolvedTextureIndex = static_cast<int64_t>(texCoords.size()) + resolvedTextureIndex;
+				} else if (resolvedTextureIndex > 0) {
+					resolvedTextureIndex = resolvedTextureIndex - 1;
+				}
+
 				if (textureObjIndex == 0 || resolvedTextureIndex < 0 ||
 					resolvedTextureIndex >= static_cast<int64_t>(texCoords.size()))
 				{
@@ -1788,9 +1812,13 @@ bool ComputeRenderer::LoadObj(
 					return false;
 				}
 
-				const int64_t resolvedNormalIndex = normalObjIndex > 0
-					? normalObjIndex - 1
-					: static_cast<int64_t>(normals.size()) + normalObjIndex;
+				int64_t resolvedNormalIndex = normalObjIndex;
+				if (resolvedNormalIndex < 0) {
+					resolvedNormalIndex = static_cast<int64_t>(normals.size()) + resolvedNormalIndex;
+				} else if (resolvedNormalIndex > 0) {
+					resolvedNormalIndex = resolvedNormalIndex - 1;
+				}
+
 				if (normalObjIndex == 0 || resolvedNormalIndex < 0 ||
 					resolvedNormalIndex >= static_cast<int64_t>(normals.size()))
 				{
@@ -1811,7 +1839,7 @@ bool ComputeRenderer::LoadObj(
 		}
 
 		// A triangle fan turns (0, 1, 2, 3) into (0, 1, 2) and (0, 2, 3).
-		// This is exact for triangles and convex polygon faces.
+		// This is exact for triangles, quads, and convex N-gon faces (5+ vertices).
 		for (size_t corner = 1; corner + 1 < faceVertices.size(); corner++)
 		{
 			if (loadedTriangles.size() >= MaxTriangleCount)
@@ -1978,8 +2006,9 @@ bool ComputeRenderer::LoadEnvironmentMap(
 		{
 			const size_t index = static_cast<size_t>(y) * width + x;
 			const float* pixel = decodedPixels + index * 4;
-			const float luminance =
+			float luminance =
 				0.2126f * pixel[0] + 0.7152f * pixel[1] + 0.0722f * pixel[2];
+			if (!std::isfinite(luminance)) luminance = 0.0f;
 			totalWeight += std::max(luminance, 0.0f) * solidAngleFactor;
 			distribution[index].CdfProbability.x = totalWeight;
 		}
@@ -2148,7 +2177,7 @@ bool ComputeRenderer::SaveScene(
 	}
 
 	file << std::setprecision(std::numeric_limits<float>::max_digits10);
-	file << "WALNUT_RAY_SCENE 8\n";
+	file << "WALNUT_RAY_SCENE 9\n";
 	file << "SPHERE_COUNT " << m_Spheres.size() << '\n';
 	for (const Sphere& sphere : m_Spheres)
 	{
@@ -2222,6 +2251,10 @@ bool ComputeRenderer::SaveScene(
 		<< m_ModelTransform.Scale.x << ' '
 		<< m_ModelTransform.Scale.y << ' '
 		<< m_ModelTransform.Scale.z << '\n';
+	// Version 9 stores the environment map path, intensity and rotation.
+	file << "ENVIRONMENT_PATH " << std::quoted(m_EnvironmentPath) << '\n';
+	file << "ENVIRONMENT_INTENSITY " << m_EnvironmentIntensity << '\n';
+	file << "ENVIRONMENT_ROTATION " << m_EnvironmentRotation << '\n';
 	file.flush();
 
 	if (!file)
@@ -2249,7 +2282,7 @@ bool ComputeRenderer::LoadScene(
 	uint32_t version = 0;
 	if (!(file >> label >> version) ||
 		label != "WALNUT_RAY_SCENE" ||
-		version < 1 || version > 8)
+		version < 1 || version > 9)
 	{
 		errorMessage = "Scene header or version is invalid.";
 		return false;
@@ -2517,6 +2550,39 @@ bool ComputeRenderer::LoadScene(
 		}
 	}
 
+	std::string loadedEnvironmentPath = m_EnvironmentPath;
+	float loadedEnvironmentIntensity = m_EnvironmentIntensity;
+	float loadedEnvironmentRotation = m_EnvironmentRotation;
+	if (version >= 9)
+	{
+		if (!(file >> label >> std::quoted(loadedEnvironmentPath)) ||
+			label != "ENVIRONMENT_PATH")
+		{
+			errorMessage = "Environment path is missing or invalid.";
+			return false;
+		}
+		if (!(file >> label >> loadedEnvironmentIntensity) || label != "ENVIRONMENT_INTENSITY")
+		{
+			errorMessage = "Environment intensity is missing or invalid.";
+			return false;
+		}
+		if (!std::isfinite(loadedEnvironmentIntensity))
+		{
+			errorMessage = "Environment intensity is not a finite number.";
+			return false;
+		}
+		if (!(file >> label >> loadedEnvironmentRotation) || label != "ENVIRONMENT_ROTATION")
+		{
+			errorMessage = "Environment rotation is missing or invalid.";
+			return false;
+		}
+		if (!std::isfinite(loadedEnvironmentRotation))
+		{
+			errorMessage = "Environment rotation is not a finite number.";
+			return false;
+		}
+	}
+
 	std::string unexpectedData;
 	if (file >> unexpectedData)
 	{
@@ -2533,6 +2599,25 @@ bool ComputeRenderer::LoadScene(
 			return false;
 		}
 		SetModelTransform(loadedModelTransform);
+	}
+
+	if (version >= 9)
+	{
+		if (!loadedEnvironmentPath.empty())
+		{
+			std::string envError;
+			if (!LoadEnvironmentMap(loadedEnvironmentPath, envError))
+			{
+				errorMessage = "Environment map could not be loaded: " + envError;
+				return false;
+			}
+		}
+		else
+		{
+			ClearEnvironmentMap();
+		}
+		m_EnvironmentIntensity = std::clamp(loadedEnvironmentIntensity, 0.0f, 100.0f);
+		m_EnvironmentRotation = loadedEnvironmentRotation;
 	}
 
 	m_Spheres = std::move(loadedSpheres);
@@ -3079,6 +3164,8 @@ void ComputeRenderer::CreateComputePipeline(const std::string& shaderPath)
 {
 	VkDevice device = Walnut::Application::GetDevice();
 	const std::vector<uint32_t> shaderCode = ReadShaderFile(shaderPath);
+	if (shaderCode.empty())
+		return;
 
 	VkShaderModuleCreateInfo shaderInfo{};
 	shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
