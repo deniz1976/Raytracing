@@ -50,14 +50,21 @@ public:
 
 	virtual void OnUpdate(float timeStep) override
 	{
+		// Right-click on the viewport also activates mouse look.
 		bool rightDown = Walnut::Input::IsMouseButtonDown(Walnut::MouseButton::Right);
-		if (rightDown && !ImGui::GetIO().WantCaptureMouse)
-			SetMouseLookEnabled(true);
-		else if (!rightDown)
+		if (rightDown && !m_MouseLookEnabled && !ImGui::GetIO().WantCaptureMouse)
+			SetMouseLookEnabled(true, true);
+		else if (!rightDown && m_MouseLookEnabled && m_MouseLookFromRightClick)
 			SetMouseLookEnabled(false);
 
 		if (!m_MouseLookEnabled)
 			return;
+
+		if (Walnut::Input::IsKeyDown(Walnut::KeyCode::Escape))
+		{
+			SetMouseLookEnabled(false);
+			return;
+		}
 
 		bool cameraChanged = false;
 		ComputeRenderer::Camera camera = m_Renderer.GetCamera();
@@ -183,8 +190,15 @@ public:
 			&m_CameraMoveSpeed,
 			0.5f,
 			15.0f);
+		if (ImGui::Button(
+			m_MouseLookEnabled
+				? "Disable Mouse Look"
+				: "Enable Mouse Look"))
+		{
+			SetMouseLookEnabled(!m_MouseLookEnabled);
+		}
 		ImGui::TextWrapped(
-			"WASD: Move | Q/E: Down/Up | Right Click: Look");
+			"WASD: Move | Q/E: Down/Up | Mouse: Look | Esc: Release | Right Click: Look");
 
 		if (cameraChanged)
 			m_Renderer.SetCamera(camera);
@@ -715,13 +729,19 @@ public:
 	}
 
 private:
-	void SetMouseLookEnabled(bool enabled)
+	void SetMouseLookEnabled(bool enabled, bool fromRightClick = false)
 	{
 		if (m_MouseLookEnabled == enabled)
 			return;
 
 		m_MouseLookEnabled = enabled;
+		m_MouseLookFromRightClick = enabled && fromRightClick;
 		m_HasMousePosition = false;
+		ImGuiIO& io = ImGui::GetIO();
+		if (enabled)
+			io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
+		else
+			io.ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
 		Walnut::Input::SetCursorMode(
 			enabled
 				? Walnut::CursorMode::Locked
@@ -737,6 +757,7 @@ private:
 	glm::vec2 m_LastMousePosition = { 0.0f, 0.0f };
 	bool m_HasMousePosition = false;
 	bool m_MouseLookEnabled = false;
+	bool m_MouseLookFromRightClick = false;
 	int m_SelectedSphereIndex = 0;
 	int m_SelectedLightIndex = 0;
 	std::string m_SceneStatus;
