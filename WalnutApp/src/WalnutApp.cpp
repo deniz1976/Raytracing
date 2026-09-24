@@ -2,12 +2,13 @@
 #include "Walnut/EntryPoint.h"
 #include "Walnut/Input/Input.h"
 
-#include "ComputeRenderer.h"
+#include "Renderer/ComputeRenderer.h"
 
 #include <glm/gtc/constants.hpp>
 
 #include <algorithm>
 #include <array>
+#include <exception>
 #include <string>
 
 namespace
@@ -21,7 +22,18 @@ class ExampleLayer : public Walnut::Layer
 public:
 	virtual void OnAttach() override
 	{
-		m_Renderer.Init("assets/shaders/RayTracing.comp.spv", 1600, 900);
+		// A renderer that cannot start leaves the app running with the reason on
+		// screen instead of terminating without a message.
+		try
+		{
+			m_Renderer.Init("assets/shaders", 1600, 900);
+		}
+		catch (const std::exception& error)
+		{
+			m_RendererError = error.what();
+			return;
+		}
+
 		std::string errorMessage;
 		if (m_Renderer.LoadObj(m_ObjPath.data(), errorMessage))
 		{
@@ -57,7 +69,7 @@ public:
 		else if (!rightDown && m_MouseLookEnabled && m_MouseLookFromRightClick)
 			SetMouseLookEnabled(false);
 
-		if (!m_MouseLookEnabled)
+		if (!m_MouseLookEnabled || !m_Renderer.IsInitialized())
 			return;
 
 		if (Walnut::Input::IsKeyDown(Walnut::KeyCode::Escape))
@@ -126,6 +138,16 @@ public:
 
 	virtual void OnUIRender() override
 	{
+		if (!m_Renderer.IsInitialized())
+		{
+			ImGui::Begin("Renderer Error");
+			ImGui::TextWrapped(
+				"The renderer could not start: %s",
+				m_RendererError.empty() ? "unknown error" : m_RendererError.c_str());
+			ImGui::End();
+			return;
+		}
+
 		ImGui::Begin("Camera and Render Controls");
 
 		// Read back every frame instead of mirroring the values here, so a scene
@@ -289,7 +311,10 @@ public:
 		}
 		float environmentIntensity = m_Renderer.GetEnvironmentIntensity();
 		if (ImGui::SliderFloat(
-			"Environment Intensity", &environmentIntensity, 0.0f, 20.0f))
+			"Environment Intensity",
+			&environmentIntensity,
+			0.0f,
+			ComputeRenderer::MaxEnvironmentIntensity))
 			m_Renderer.SetEnvironmentIntensity(environmentIntensity);
 		float environmentRotation = m_Renderer.GetEnvironmentRotation();
 		if (ImGui::SliderFloat(
@@ -325,6 +350,13 @@ public:
 				m_SceneStatus = "OBJ load failed: " + errorMessage;
 			}
 		}
+		ImGui::SameLine();
+		if (ImGui::Button("Use Built-in Triangle"))
+		{
+			m_Renderer.ClearModel();
+			m_ObjPath.fill('\0');
+			m_SceneStatus = "Built-in triangle restored.";
+		}
 		ImGui::TextWrapped(
 			"OBJ faces replace the current triangle model. Polygon faces are "
 			"triangulated and use diffuse MTL colors. Vertex normals enable "
@@ -345,8 +377,8 @@ public:
 			"Model Scale",
 			&modelTransform.Scale.x,
 			0.01f,
-			0.01f,
-			100.0f);
+			ComputeRenderer::MinModelScale,
+			ComputeRenderer::MaxModelScale);
 		if (ImGui::Button("Reset Model Transform"))
 		{
 			modelTransform = {};
@@ -356,7 +388,8 @@ public:
 			m_Renderer.SetModelTransform(modelTransform);
 		ImGui::TextWrapped(
 			"Rotation uses degrees. Scale is applied per axis and remains "
-			"positive to preserve triangle orientation.");
+			"positive to preserve triangle orientation. Moving the model only "
+			"updates its transform; the triangles and their BVH stay as built.");
 		ImGui::Text(
 			"Spheres: %u / %u",
 			sphereCount,
@@ -643,15 +676,17 @@ public:
 		}
 		else
 		{
-			ImGui::Text("VK_KHR_ray_query: unsupported");
+			ImGui::TextWrapped(
+				"VK_KHR_ray_query: unsupported, the fallback shader traverses the "
+				"compute BVH instead.");
 		}
 		ImGui::TextWrapped(
 			"This toggle compares the custom compute BVH with hardware triangle "
 			"traversal. Analytic spheres still use the custom sphere BVH.");
 
 		bool sahSplitEnabled = m_Renderer.IsSahSplitEnabled();
-		// Same reasoning as the BVH toggle: a different split rearranges the tree
-		// but cannot change which sphere a ray meets first, so the samples stand.
+		// Same reasoning as the BVH toggle: a different split rearranges the trees
+		// but cannot change which primitive a ray meets first, so the samples stand.
 		if (ImGui::Checkbox("SAH split (off: median split)", &sahSplitEnabled))
 			m_Renderer.SetSahSplitEnabled(sahSplitEnabled);
 
@@ -698,11 +733,11 @@ public:
 			"time even when the dispatch is much shorter.");
 		ImGui::TextWrapped(
 			"Turn the BVH off to compare both trees against testing every sphere "
-			"and triangle. The triangle tree uses a balanced median split and up "
-			"to four triangles per leaf. "
-			"The split heuristic decides where each range of spheres is cut in "
+			"and triangle. Both trees use the same builder and hold up to four "
+			"primitives per leaf. "
+			"The split heuristic decides where each range of primitives is cut in "
 			"two: the surface area heuristic cuts where the two child boxes are "
-			"cheapest to trace, while the median split cuts where the sphere "
+			"cheapest to trace, while the median split cuts where the primitive "
 			"count is even. Estimated sphere tests per ray is what the heuristic "
 			"itself predicts for the finished tree, so it compares two trees over "
 			"the same scene immediately, without waiting for a timing average to "
@@ -761,6 +796,7 @@ private:
 	int m_SelectedSphereIndex = 0;
 	int m_SelectedLightIndex = 0;
 	std::string m_SceneStatus;
+	std::string m_RendererError;
 };
 
 Walnut::Application* Walnut::CreateApplication(int argc, char** argv)

@@ -1,10 +1,18 @@
 #version 460
+#extension GL_GOOGLE_include_directive : require
+
+// Compiled twice: with USE_RAY_QUERY for devices that support VK_KHR_ray_query,
+// and without it as a fallback that always traverses the custom triangle BVH.
+#ifdef USE_RAY_QUERY
 #extension GL_EXT_ray_query : require
+#endif
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#include "ShaderInterface.h"
 
-layout(set = 0, binding = 0, rgba8) uniform writeonly image2D u_OutputImage;
-layout(set = 0, binding = 1, rgba32f) uniform image2D u_AccumulationImage;
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = WORKGROUP_SIZE, local_size_z = 1) in;
+
+layout(set = 0, binding = BINDING_OUTPUT_IMAGE, rgba8) uniform writeonly image2D u_OutputImage;
+layout(set = 0, binding = BINDING_ACCUMULATION_IMAGE, rgba32f) uniform image2D u_AccumulationImage;
 
 struct SphereData
 {
@@ -14,17 +22,17 @@ struct SphereData
 	vec4 RoughnessMaterial;
 };
 
-layout(std430, set = 0, binding = 2) readonly buffer SphereBuffer
+layout(std430, set = 0, binding = BINDING_SPHERES) readonly buffer SphereBuffer
 {
 	SphereData Spheres[];
 } u_SphereBuffer;
 
-// Links.x is the left child of an interior node or the first sphere of a leaf,
-// Links.y is the right child, Links.z is the sphere count and Links.w is the axis
-// the range was split along. A count of zero marks an interior node.
+// Links.x is the left child of an interior node or the first primitive of a leaf,
+// Links.y is the right child, Links.z is the primitive count and Links.w is the
+// axis the range was split along. A count of zero marks an interior node.
 //
-// The build guarantees the left child holds the spheres with the smaller
-// coordinate along that axis, which is what lets the traversal below work out
+// The build guarantees the left child holds the primitives with the smaller
+// centroid along that axis, which is what lets the traversal below work out
 // which child is the near one from the sign of the ray direction alone.
 struct BvhNodeData
 {
@@ -33,7 +41,7 @@ struct BvhNodeData
 	uvec4 Links;
 };
 
-layout(std430, set = 0, binding = 3) readonly buffer BvhBuffer
+layout(std430, set = 0, binding = BINDING_SPHERE_BVH) readonly buffer BvhBuffer
 {
 	BvhNodeData Nodes[];
 } u_BvhBuffer;
@@ -48,11 +56,13 @@ struct SphereLightData
 	vec4 RadiusSampling;
 };
 
-layout(std430, set = 0, binding = 4) readonly buffer LightBuffer
+layout(std430, set = 0, binding = BINDING_LIGHTS) readonly buffer LightBuffer
 {
 	SphereLightData Lights[];
 } u_LightBuffer;
 
+// Triangles are stored in the model's own space. The model transform is applied
+// to the ray instead, so moving the model never rebuilds this buffer or its BVH.
 struct TriangleData
 {
 	vec4 Vertex0;
@@ -65,27 +75,38 @@ struct TriangleData
 	vec4 Normal1;
 	vec4 Normal2;
 	vec4 TexCoord01;
-	// TexCoord2.w is one when all three corners have UV coordinates.
+	// TexCoord2.z is one when an image texture is sampled and w is one when all
+	// three corners have UV coordinates.
 	vec4 TexCoord2;
 };
 
-layout(std430, set = 0, binding = 5) readonly buffer TriangleBuffer
+layout(std430, set = 0, binding = BINDING_TRIANGLES) readonly buffer TriangleBuffer
 {
 	TriangleData Triangles[];
 } u_TriangleBuffer;
 
-layout(std430, set = 0, binding = 6) readonly buffer TriangleBvhBuffer
+layout(std430, set = 0, binding = BINDING_TRIANGLE_BVH) readonly buffer TriangleBvhBuffer
 {
 	BvhNodeData Nodes[];
 } u_TriangleBvhBuffer;
 
-layout(set = 0, binding = 7) uniform sampler2D u_ModelTexture;
-layout(set = 0, binding = 8) uniform sampler2D u_EnvironmentTexture;
-layout(set = 0, binding = 9) uniform accelerationStructureEXT u_TriangleTlas;
-layout(std430, set = 0, binding = 10) readonly buffer EnvironmentDistributionBuffer
+layout(set = 0, binding = BINDING_MODEL_TEXTURE) uniform sampler2D u_ModelTexture;
+layout(set = 0, binding = BINDING_ENVIRONMENT_TEXTURE) uniform sampler2D u_EnvironmentTexture;
+
+layout(std430, set = 0, binding = BINDING_ENVIRONMENT_DISTRIBUTION) readonly buffer EnvironmentDistributionBuffer
 {
+	// x is the running CDF, y the probability of that texel.
 	vec4 Entries[];
 } u_EnvironmentDistribution;
+
+layout(std430, set = 0, binding = BINDING_MODEL_TRANSFORM) readonly buffer ModelTransformBuffer
+{
+	mat4 WorldToObject;
+} u_Model;
+
+#ifdef USE_RAY_QUERY
+layout(set = 0, binding = BINDING_TRIANGLE_TLAS) uniform accelerationStructureEXT u_TriangleTlas;
+#endif
 
 layout(push_constant) uniform PushConstants
 {
@@ -95,30 +116,28 @@ layout(push_constant) uniform PushConstants
 	float VerticalFov;
 	float Exposure;
 	uint SphereCount;
-	uvec4 SceneSettings;
 	uint TriangleCount;
+	uint LightCount;
+	uint BounceCount;
+	uint Flags;
 	float EnvironmentIntensity;
 	float EnvironmentRotation;
-	uint HasEnvironmentMap;
-	uvec4 HardwareSettings;
+	uint EnvironmentWidth;
+	uint EnvironmentHeight;
 } u_PushConstants;
 
 const float RAY_EPSILON = 0.001;
 const float PI = 3.14159265359;
+const float NO_HIT = 1e30;
 // Let the first few path segments run deterministically, then spend fewer rays
 // on weak paths without changing their expected contribution.
 const uint RUSSIAN_ROULETTE_START_BOUNCE = 3u;
 const float MIN_PATH_SURVIVAL_PROBABILITY = 0.05;
 const float MAX_PATH_SURVIVAL_PROBABILITY = 0.95;
-const uint MATERIAL_LEGACY = 0u;
-const uint MATERIAL_DIFFUSE = 1u;
-const uint MATERIAL_METAL = 2u;
-const uint MATERIAL_DIELECTRIC = 3u;
 
-// A stack entry is only worth pushing if the far child can still turn out to be
-// worth visiting, so both children go on and the near one comes off first. The
-// build bounds the tree depth to well under this, and pushes stay guarded.
-const int BVH_STACK_SIZE = 32;
+const uint HIT_NONE = 0u;
+const uint HIT_SPHERE = 1u;
+const uint HIT_TRIANGLE = 2u;
 
 struct Ray
 {
@@ -143,6 +162,16 @@ struct SphereLight
 	float Intensity;
 };
 
+// The cheap part of a hit, found during traversal. Surface details are only
+// worked out once, for the closest hit, instead of for every candidate.
+struct SceneHit
+{
+	float Distance;
+	uint Kind;
+	uint Index;
+	vec2 Barycentrics;
+};
+
 struct HitRecord
 {
 	float Distance;
@@ -151,6 +180,11 @@ struct HitRecord
 	bool FrontFace;
 	Material SurfaceMaterial;
 };
+
+bool HasFlag(uint flag)
+{
+	return (u_PushConstants.Flags & flag) != 0u;
+}
 
 uint Hash(uint value)
 {
@@ -162,15 +196,22 @@ uint Hash(uint value)
 	return value;
 }
 
+// The top 24 bits fill a float mantissa exactly, so the result is uniform in
+// [0, 1) and can never round up to one.
+float UintToUnitFloat(uint value)
+{
+	return float(value >> 8) * (1.0 / 16777216.0);
+}
+
 float RandomFloat(uint seed)
 {
-	return float(Hash(seed)) / 4294967295.0;
+	return UintToUnitFloat(Hash(seed));
 }
 
 float NextRandom(inout uint state)
 {
 	state = Hash(state);
-	return float(state) / 4294967295.0;
+	return UintToUnitFloat(state);
 }
 
 // Schlick's approximation turns the view angle and optical density into the
@@ -197,9 +238,6 @@ vec3 RandomUnitVector(inout uint state)
 		z);
 }
 
-// A Lambert surface scatters most strongly near its normal. Sampling that
-// cosine distribution follows the integrand and keeps the estimator's variance
-// lower than choosing every hemisphere direction equally often.
 vec3 LocalToWorld(vec3 localDirection, vec3 normal)
 {
 	vec3 helperAxis = abs(normal.z) < 0.999
@@ -214,6 +252,9 @@ vec3 LocalToWorld(vec3 localDirection, vec3 normal)
 		normal * localDirection.z);
 }
 
+// A Lambert surface scatters most strongly near its normal. Sampling that
+// cosine distribution follows the integrand and keeps the estimator's variance
+// lower than choosing every hemisphere direction equally often.
 vec3 RandomCosineHemisphere(vec3 normal, inout uint state)
 {
 	float firstRandom = NextRandom(state);
@@ -268,6 +309,11 @@ float SmithGgxMasking(float normalDotDirection, float alpha)
 		max(normalDotDirection + root, 1e-8);
 }
 
+float GgxAlpha(Material material)
+{
+	return max(material.Roughness * material.Roughness, 0.001);
+}
+
 vec3 EvaluateMetalBrdf(
 	Material material,
 	vec3 surfaceNormal,
@@ -286,7 +332,7 @@ vec3 EvaluateMetalBrdf(
 	vec3 halfwayDirection = normalize(halfwaySum);
 	float normalDotHalfway = max(dot(surfaceNormal, halfwayDirection), 0.0);
 	float viewDotHalfway = max(dot(viewDirection, halfwayDirection), 0.0);
-	float alpha = max(material.Roughness * material.Roughness, 0.001);
+	float alpha = GgxAlpha(material);
 
 	vec3 fresnel =
 		FresnelSchlick(viewDotHalfway, material.Albedo) *
@@ -317,9 +363,8 @@ float MetalReflectionPdf(
 	if (normalDotHalfway <= 0.0 || viewDotHalfway <= 0.0)
 		return 0.0;
 
-	float alpha = max(material.Roughness * material.Roughness, 0.001);
 	float halfwayPdf =
-		GgxDistribution(normalDotHalfway, alpha) *
+		GgxDistribution(normalDotHalfway, GgxAlpha(material)) *
 		normalDotHalfway;
 	return halfwayPdf / (4.0 * viewDotHalfway);
 }
@@ -330,7 +375,7 @@ vec3 SampleGgxReflection(
 	vec3 viewDirection,
 	inout uint randomState)
 {
-	float alpha = max(material.Roughness * material.Roughness, 0.001);
+	float alpha = GgxAlpha(material);
 	float alphaSquared = alpha * alpha;
 	float firstRandom = NextRandom(randomState);
 	float secondRandom = NextRandom(randomState);
@@ -350,6 +395,8 @@ vec3 SampleGgxReflection(
 	return normalize(reflect(-viewDirection, halfwayDirection));
 }
 
+// Legacy direct lighting uses the Lambert lobe too, which is why only Metal is
+// special cased here.
 vec3 EvaluateSurfaceBrdf(
 	Material material,
 	vec3 surfaceNormal,
@@ -365,12 +412,20 @@ vec3 EvaluateSurfaceBrdf(
 		: EvaluateLambertBrdf(material);
 }
 
+// The density with which the path continuation would have picked this
+// direction, used to weigh light samples against BSDF samples. Legacy surfaces
+// never continue with a sample from the lobe they are lit with, so no BSDF
+// strategy competes with their light samples and the density is zero; weighing
+// them anyway would drop part of their direct light for nothing in return.
 float SurfaceDirectionPdf(
 	Material material,
 	vec3 surfaceNormal,
 	vec3 viewDirection,
 	vec3 sampledDirection)
 {
+	if (material.Type == MATERIAL_LEGACY)
+		return 0.0;
+
 	return material.Type == MATERIAL_METAL
 		? MetalReflectionPdf(
 			material,
@@ -380,27 +435,18 @@ float SurfaceDirectionPdf(
 		: LambertPdf(surfaceNormal, sampledDirection);
 }
 
-Material GetSphereMaterial(SphereData sphere)
+Material UnpackMaterial(vec4 albedoReflectivity, vec4 roughnessMaterial)
 {
 	Material material;
-	material.Albedo = sphere.AlbedoReflectivity.xyz;
-	material.Reflectivity = sphere.AlbedoReflectivity.w;
-	material.Roughness = sphere.RoughnessMaterial.x;
-	material.Type = uint(sphere.RoughnessMaterial.y);
-	material.IndexOfRefraction = sphere.RoughnessMaterial.z;
+	material.Albedo = albedoReflectivity.xyz;
+	material.Reflectivity = albedoReflectivity.w;
+	material.Roughness = roughnessMaterial.x;
+	material.Type = uint(roughnessMaterial.y);
+	material.IndexOfRefraction = roughnessMaterial.z;
 	return material;
 }
 
-Material GetTriangleMaterial(TriangleData triangle)
-{
-	Material material;
-	material.Albedo = triangle.AlbedoReflectivity.xyz;
-	material.Reflectivity = triangle.AlbedoReflectivity.w;
-	material.Roughness = triangle.RoughnessMaterial.x;
-	material.Type = uint(triangle.RoughnessMaterial.y);
-	material.IndexOfRefraction = triangle.RoughnessMaterial.z;
-	return material;
-}
+// ---------------------------------------------------------------- geometry
 
 float HitSphereGeometry(Ray ray, vec3 sphereCenter, float sphereRadius)
 {
@@ -428,101 +474,19 @@ float HitSphereGeometry(Ray ray, vec3 sphereCenter, float sphereRadius)
 	return -1.0;
 }
 
-float HitSphere(Ray ray, SphereData sphere)
-{
-	return HitSphereGeometry(
-		ray,
-		sphere.CenterRadius.xyz,
-		sphere.CenterRadius.w);
-}
-
-bool EvaluateTriangleSurface(
-	TriangleData triangle,
-	vec2 barycentrics,
-	out vec3 geometricNormal,
-	out vec3 shadingNormal,
-	out vec3 textureTint)
-{
-	vec3 vertex0 = triangle.Vertex0.xyz;
-	vec3 edge1 = triangle.Vertex1.xyz - vertex0;
-	vec3 edge2 = triangle.Vertex2.xyz - vertex0;
-	geometricNormal = vec3(0.0);
-	shadingNormal = vec3(0.0);
-	textureTint = vec3(1.0);
-	vec3 normalCross = cross(edge1, edge2);
-	if (dot(normalCross, normalCross) <= 1e-16)
-		return false;
-
-	float barycentricU = barycentrics.x;
-	float barycentricV = barycentrics.y;
-	geometricNormal = normalize(normalCross);
-	shadingNormal = geometricNormal;
-	if (triangle.Normal0.w > 0.5)
-	{
-		float barycentricW = 1.0 - barycentricU - barycentricV;
-		vec3 interpolatedNormal =
-			triangle.Normal0.xyz * barycentricW +
-			triangle.Normal1.xyz * barycentricU +
-			triangle.Normal2.xyz * barycentricV;
-		if (dot(interpolatedNormal, interpolatedNormal) > 1e-12)
-		{
-			shadingNormal = normalize(interpolatedNormal);
-			// Imported normals may use the opposite winding convention. Keep the
-			// shading normal in the geometric normal's hemisphere before orienting
-			// both against the ray below.
-			if (dot(shadingNormal, geometricNormal) < 0.0)
-				shadingNormal = -shadingNormal;
-		}
-	}
-	if (triangle.TexCoord2.w > 0.5)
-	{
-		float barycentricW = 1.0 - barycentricU - barycentricV;
-		vec2 texCoord0 = triangle.TexCoord01.xy;
-		vec2 texCoord1 = triangle.TexCoord01.zw;
-		vec2 texCoord2 = triangle.TexCoord2.xy;
-		vec2 texCoord =
-			texCoord0 * barycentricW +
-			texCoord1 * barycentricU +
-			texCoord2 * barycentricV;
-		if (triangle.TexCoord2.z > 0.5)
-		{
-			// stb_image's row zero is the top of the image while OBJ convention
-			// normally treats V=0 as the bottom, so V is flipped at sampling time.
-			vec3 encodedColor = texture(
-				u_ModelTexture,
-				vec2(texCoord.x, 1.0 - texCoord.y)).rgb;
-			textureTint = pow(encodedColor, vec3(2.2));
-		}
-		else
-		{
-			ivec2 checkerCell = ivec2(floor(texCoord * 8.0));
-			bool lightCell = ((checkerCell.x + checkerCell.y) & 1) == 0;
-			textureTint = lightCell
-				? vec3(1.0)
-				: vec3(0.18);
-		}
-	}
-	return true;
-}
-
 // Moller-Trumbore expresses the hit in the triangle's two edge directions.
 // The barycentric u/v checks reject points outside without constructing a plane.
-float HitTriangle(
-	Ray ray,
-	TriangleData triangle,
-	out vec3 geometricNormal,
-	out vec3 shadingNormal,
-	out vec3 textureTint)
+// The ray may be in object space with an unnormalised direction; the returned
+// distance is then still the world space ray parameter.
+float HitTriangleGeometry(Ray ray, TriangleData triangle, out vec2 barycentrics)
 {
+	barycentrics = vec2(0.0);
 	vec3 vertex0 = triangle.Vertex0.xyz;
 	vec3 edge1 = triangle.Vertex1.xyz - vertex0;
 	vec3 edge2 = triangle.Vertex2.xyz - vertex0;
 	vec3 directionCrossEdge2 = cross(ray.Direction, edge2);
 	float determinant = dot(edge1, directionCrossEdge2);
-	geometricNormal = vec3(0.0);
-	shadingNormal = vec3(0.0);
-	textureTint = vec3(1.0);
-	if (abs(determinant) < 1e-8)
+	if (abs(determinant) < 1e-12)
 		return -1.0;
 
 	float inverseDeterminant = 1.0 / determinant;
@@ -539,54 +503,19 @@ float HitTriangle(
 		return -1.0;
 
 	float hitDistance = dot(edge2, originCrossEdge1) * inverseDeterminant;
-	if (hitDistance <= RAY_EPSILON ||
-		!EvaluateTriangleSurface(
-			triangle,
-			vec2(barycentricU, barycentricV),
-			geometricNormal,
-			shadingNormal,
-			textureTint))
-	{
+	if (hitDistance <= RAY_EPSILON)
 		return -1.0;
-	}
 
+	barycentrics = vec2(barycentricU, barycentricV);
 	return hitDistance;
 }
 
-bool IntersectTriangleRange(
-	Ray ray,
-	uint firstTriangle,
-	uint triangleCount,
-	inout HitRecord closestHit)
+Ray ToObjectSpace(Ray ray)
 {
-	bool hitAnything = false;
-	for (uint offset = 0u; offset < triangleCount; offset++)
-	{
-		TriangleData triangle =
-			u_TriangleBuffer.Triangles[firstTriangle + offset];
-		vec3 geometricNormal;
-		vec3 shadingNormal;
-		vec3 textureTint;
-		float hitDistance = HitTriangle(
-			ray,
-			triangle,
-			geometricNormal,
-			shadingNormal,
-			textureTint);
-		if (hitDistance > 0.0 && hitDistance < closestHit.Distance)
-		{
-			hitAnything = true;
-			closestHit.Distance = hitDistance;
-			closestHit.Position = ray.Origin + ray.Direction * hitDistance;
-			closestHit.FrontFace = dot(ray.Direction, geometricNormal) < 0.0;
-			closestHit.Normal = closestHit.FrontFace
-				? shadingNormal
-				: -shadingNormal;
-			closestHit.SurfaceMaterial = GetTriangleMaterial(triangle);
-			closestHit.SurfaceMaterial.Albedo *= textureTint;
-		}
-	}
-	return hitAnything;
+	Ray objectRay;
+	objectRay.Origin = (u_Model.WorldToObject * vec4(ray.Origin, 1.0)).xyz;
+	objectRay.Direction = mat3(u_Model.WorldToObject) * ray.Direction;
+	return objectRay;
 }
 
 // A zero direction component would turn into an infinite reciprocal, and the
@@ -609,18 +538,15 @@ vec3 SafeInverseDirection(vec3 direction)
 
 // Slab test. Each axis gives the distance range in which the ray is inside that
 // pair of parallel planes. The ray touches the box when the three ranges
-// overlap, so the largest entry distance must not exceed the smallest exit
-// distance. maximumDistance discards boxes that are farther than the closest
-// surface found so far.
+// overlap. maximumDistance discards boxes farther than the closest hit so far.
 bool HitAabb(
 	vec3 rayOrigin,
 	vec3 inverseDirection,
-	vec3 boundsMin,
-	vec3 boundsMax,
+	BvhNodeData node,
 	float maximumDistance)
 {
-	vec3 firstPlane = (boundsMin - rayOrigin) * inverseDirection;
-	vec3 secondPlane = (boundsMax - rayOrigin) * inverseDirection;
+	vec3 firstPlane = (node.BoundsMin.xyz - rayOrigin) * inverseDirection;
+	vec3 secondPlane = (node.BoundsMax.xyz - rayOrigin) * inverseDirection;
 
 	vec3 nearPlanes = min(firstPlane, secondPlane);
 	vec3 farPlanes = max(firstPlane, secondPlane);
@@ -635,8 +561,89 @@ bool HitAabb(
 	return entryDistance <= exitDistance && entryDistance < maximumDistance;
 }
 
-bool IntersectTriangleBvh(Ray ray, inout HitRecord closestHit)
+// Both children go on the stack and the near one comes off first, so a surface
+// found early shrinks the distance the far box is pruned against. The build
+// bounds the tree depth below the stack size, so the push guard at the call
+// sites only keeps a broken tree from writing out of bounds.
+void OrderChildren(
+	BvhNodeData node,
+	vec3 rayDirection,
+	out uint pushedFirst,
+	out uint pushedSecond)
 {
+	bool leftIsNear = rayDirection[node.Links.w] >= 0.0;
+	pushedFirst = leftIsNear ? node.Links.y : node.Links.x;
+	pushedSecond = leftIsNear ? node.Links.x : node.Links.y;
+}
+
+// Every intersection routine below keeps the nearest hit closer than
+// hit.Distance. With anyHit set it returns at the first such hit instead, which
+// is all a shadow ray needs to know.
+bool IntersectSphereRange(
+	Ray ray,
+	uint firstSphere,
+	uint sphereCount,
+	bool anyHit,
+	inout SceneHit hit)
+{
+	bool hitAnything = false;
+	for (uint offset = 0u; offset < sphereCount; offset++)
+	{
+		SphereData sphere = u_SphereBuffer.Spheres[firstSphere + offset];
+		float distance = HitSphereGeometry(
+			ray,
+			sphere.CenterRadius.xyz,
+			sphere.CenterRadius.w);
+		if (distance > 0.0 && distance < hit.Distance)
+		{
+			hit.Distance = distance;
+			hit.Kind = HIT_SPHERE;
+			hit.Index = firstSphere + offset;
+			hitAnything = true;
+			if (anyHit)
+				return true;
+		}
+	}
+	return hitAnything;
+}
+
+bool IntersectTriangleRange(
+	Ray objectRay,
+	uint firstTriangle,
+	uint triangleCount,
+	bool anyHit,
+	inout SceneHit hit)
+{
+	bool hitAnything = false;
+	for (uint offset = 0u; offset < triangleCount; offset++)
+	{
+		vec2 barycentrics;
+		float distance = HitTriangleGeometry(
+			objectRay,
+			u_TriangleBuffer.Triangles[firstTriangle + offset],
+			barycentrics);
+		if (distance > 0.0 && distance < hit.Distance)
+		{
+			hit.Distance = distance;
+			hit.Kind = HIT_TRIANGLE;
+			hit.Index = firstTriangle + offset;
+			hit.Barycentrics = barycentrics;
+			hitAnything = true;
+			if (anyHit)
+				return true;
+		}
+	}
+	return hitAnything;
+}
+
+bool TraceSpheres(Ray ray, bool anyHit, inout SceneHit hit)
+{
+	uint sphereCount = u_PushConstants.SphereCount;
+	if (!HasFlag(RENDER_FLAG_USE_BVH))
+		return IntersectSphereRange(ray, 0u, sphereCount, anyHit, hit);
+	if (sphereCount == 0u)
+		return false;
+
 	bool hitAnything = false;
 	vec3 inverseDirection = SafeInverseDirection(ray.Direction);
 	uint nodeStack[BVH_STACK_SIZE];
@@ -645,90 +652,103 @@ bool IntersectTriangleBvh(Ray ray, inout HitRecord closestHit)
 
 	while (stackSize > 0)
 	{
-		BvhNodeData node =
-			u_TriangleBvhBuffer.Nodes[nodeStack[--stackSize]];
-		if (!HitAabb(
-			ray.Origin,
-			inverseDirection,
-			node.BoundsMin.xyz,
-			node.BoundsMax.xyz,
-			closestHit.Distance))
-		{
+		BvhNodeData node = u_BvhBuffer.Nodes[nodeStack[--stackSize]];
+		if (!HitAabb(ray.Origin, inverseDirection, node, hit.Distance))
 			continue;
-		}
 
-		if (node.Links.z > 0u)
+		if (node.Links.z == 0u)
 		{
-			if (IntersectTriangleRange(
-				ray,
-				node.Links.x,
-				node.Links.z,
-				closestHit))
+			if (stackSize + 2 <= BVH_STACK_SIZE)
 			{
-				hitAnything = true;
+				uint farChild;
+				uint nearChild;
+				OrderChildren(node, ray.Direction, farChild, nearChild);
+				nodeStack[stackSize++] = farChild;
+				nodeStack[stackSize++] = nearChild;
 			}
 			continue;
 		}
 
-		if (stackSize + 2 <= BVH_STACK_SIZE)
-		{
-			int splitAxis = int(node.Links.w);
-			bool leftIsNear = ray.Direction[splitAxis] >= 0.0;
-			nodeStack[stackSize++] = leftIsNear
-				? node.Links.y : node.Links.x;
-			nodeStack[stackSize++] = leftIsNear
-				? node.Links.x : node.Links.y;
-		}
-	}
-
-	return hitAnything;
-}
-
-// Tests one contiguous run of the sphere buffer and keeps the nearest hit. The
-// spheres are uploaded in tree order, so a leaf owns such a run.
-bool IntersectSphereRange(
-	Ray ray,
-	uint firstSphere,
-	uint sphereCount,
-	inout HitRecord closestHit)
-{
-	bool hitAnything = false;
-
-	for (uint offset = 0; offset < sphereCount; offset++)
-	{
-		SphereData sphere = u_SphereBuffer.Spheres[firstSphere + offset];
-		float hitDistance = HitSphere(ray, sphere);
-
-		if (hitDistance > 0.0 && hitDistance < closestHit.Distance)
+		if (IntersectSphereRange(ray, node.Links.x, node.Links.z, anyHit, hit))
 		{
 			hitAnything = true;
-			closestHit.Distance = hitDistance;
-			closestHit.Position = ray.Origin + ray.Direction * hitDistance;
-			vec3 outwardNormal = normalize(
-				closestHit.Position - sphere.CenterRadius.xyz);
-			closestHit.FrontFace = dot(ray.Direction, outwardNormal) < 0.0;
-			closestHit.Normal = closestHit.FrontFace
-				? outwardNormal
-				: -outwardNormal;
-			closestHit.SurfaceMaterial = GetSphereMaterial(sphere);
+			if (anyHit)
+				return true;
 		}
 	}
 
 	return hitAnything;
 }
 
-bool IntersectTrianglesRayQuery(Ray ray, inout HitRecord closestHit)
+bool TraceTriangleBvh(Ray ray, bool anyHit, inout SceneHit hit)
 {
+	Ray objectRay = ToObjectSpace(ray);
+	if (!HasFlag(RENDER_FLAG_USE_BVH))
+	{
+		return IntersectTriangleRange(
+			objectRay, 0u, u_PushConstants.TriangleCount, anyHit, hit);
+	}
+
+	bool hitAnything = false;
+	vec3 inverseDirection = SafeInverseDirection(objectRay.Direction);
+	uint nodeStack[BVH_STACK_SIZE];
+	int stackSize = 0;
+	nodeStack[stackSize++] = 0u;
+
+	while (stackSize > 0)
+	{
+		BvhNodeData node = u_TriangleBvhBuffer.Nodes[nodeStack[--stackSize]];
+		if (!HitAabb(objectRay.Origin, inverseDirection, node, hit.Distance))
+			continue;
+
+		if (node.Links.z == 0u)
+		{
+			if (stackSize + 2 <= BVH_STACK_SIZE)
+			{
+				uint farChild;
+				uint nearChild;
+				OrderChildren(node, objectRay.Direction, farChild, nearChild);
+				nodeStack[stackSize++] = farChild;
+				nodeStack[stackSize++] = nearChild;
+			}
+			continue;
+		}
+
+		if (IntersectTriangleRange(
+			objectRay, node.Links.x, node.Links.z, anyHit, hit))
+		{
+			hitAnything = true;
+			if (anyHit)
+				return true;
+		}
+	}
+
+	return hitAnything;
+}
+
+#ifdef USE_RAY_QUERY
+// Hardware traversal of the same triangles. The TLAS instance carries the model
+// transform and custom index zero, so the primitive index addresses the
+// triangle buffer directly and the distance is the world space ray parameter.
+bool TraceTrianglesRayQuery(Ray ray, bool anyHit, inout SceneHit hit)
+{
+	if (hit.Distance <= RAY_EPSILON)
+		return false;
+
+	uint rayFlags = gl_RayFlagsOpaqueEXT;
+	if (anyHit)
+		rayFlags |= gl_RayFlagsTerminateOnFirstHitEXT;
+
 	rayQueryEXT query;
 	rayQueryInitializeEXT(
 		query,
 		u_TriangleTlas,
-		gl_RayFlagsOpaqueEXT,
+		rayFlags,
 		0xff,
 		ray.Origin,
 		RAY_EPSILON,
 		ray.Direction,
-		closestHit.Distance);
+		hit.Distance);
 	while (rayQueryProceedEXT(query))
 	{
 	}
@@ -738,289 +758,146 @@ bool IntersectTrianglesRayQuery(Ray ray, inout HitRecord closestHit)
 		return false;
 	}
 
-	uint triangleIndex =
-		rayQueryGetIntersectionInstanceCustomIndexEXT(query, true) +
-		rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
-	TriangleData triangle = u_TriangleBuffer.Triangles[triangleIndex];
-	vec3 geometricNormal;
-	vec3 shadingNormal;
-	vec3 textureTint;
-	float hitDistance = rayQueryGetIntersectionTEXT(query, true);
-	vec2 barycentrics =
-		rayQueryGetIntersectionBarycentricsEXT(query, true);
-	if (hitDistance <= 0.0 || hitDistance >= closestHit.Distance ||
-		!EvaluateTriangleSurface(
-			triangle,
-			barycentrics,
-			geometricNormal,
-			shadingNormal,
-			textureTint))
-	{
-		return false;
-	}
-
-	closestHit.Distance = hitDistance;
-	closestHit.Position = ray.Origin + ray.Direction * hitDistance;
-	closestHit.FrontFace = dot(ray.Direction, geometricNormal) < 0.0;
-	closestHit.Normal = closestHit.FrontFace
-		? shadingNormal
-		: -shadingNormal;
-	closestHit.SurfaceMaterial = GetTriangleMaterial(triangle);
-	closestHit.SurfaceMaterial.Albedo *= textureTint;
+	hit.Distance = rayQueryGetIntersectionTEXT(query, true);
+	hit.Kind = HIT_TRIANGLE;
+	hit.Index =
+		uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)) +
+		uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
+	hit.Barycentrics = rayQueryGetIntersectionBarycentricsEXT(query, true);
 	return true;
 }
+#endif
 
-bool TraceScene(
-	Ray ray,
-	out HitRecord closestHit)
+bool TraceTriangles(Ray ray, bool anyHit, inout SceneHit hit)
 {
-	closestHit.Distance = 1e30;
-	bool hitAnything = false;
+	if (u_PushConstants.TriangleCount == 0u)
+		return false;
 
-	if (u_PushConstants.SceneSettings.x == 0u)
-	{
-		hitAnything = IntersectSphereRange(
-			ray,
-			0u,
-			u_PushConstants.SphereCount,
-			closestHit);
-	}
-	else
-	{
-		vec3 inverseDirection = SafeInverseDirection(ray.Direction);
-		uint nodeStack[BVH_STACK_SIZE];
-		int stackSize = 0;
-		nodeStack[stackSize++] = 0u;
-
-		while (stackSize > 0)
-		{
-			BvhNodeData node = u_BvhBuffer.Nodes[nodeStack[--stackSize]];
-
-			if (!HitAabb(
-				ray.Origin,
-				inverseDirection,
-				node.BoundsMin.xyz,
-				node.BoundsMax.xyz,
-				closestHit.Distance))
-			{
-				continue;
-			}
-
-			if (node.Links.z > 0u)
-			{
-				if (IntersectSphereRange(
-					ray,
-					node.Links.x,
-					node.Links.z,
-					closestHit))
-				{
-					hitAnything = true;
-				}
-				continue;
-			}
-
-			if (stackSize + 2 <= BVH_STACK_SIZE)
-			{
-				int splitAxis = int(node.Links.w);
-				bool leftIsNear = ray.Direction[splitAxis] >= 0.0;
-				nodeStack[stackSize++] = leftIsNear
-					? node.Links.y : node.Links.x;
-				nodeStack[stackSize++] = leftIsNear
-					? node.Links.x : node.Links.y;
-			}
-		}
-	}
-
-	if (u_PushConstants.TriangleCount > 0u)
-	{
-		bool hitTriangles = u_PushConstants.HardwareSettings.x != 0u
-			? IntersectTrianglesRayQuery(ray, closestHit)
-			: u_PushConstants.SceneSettings.x == 0u
-			? IntersectTriangleRange(
-				ray,
-				0u,
-				u_PushConstants.TriangleCount,
-				closestHit)
-			: IntersectTriangleBvh(ray, closestHit);
-		if (hitTriangles)
-			hitAnything = true;
-	}
-
-	return hitAnything;
+#ifdef USE_RAY_QUERY
+	if (HasFlag(RENDER_FLAG_RAY_QUERY))
+		return TraceTrianglesRayQuery(ray, anyHit, hit);
+#endif
+	return TraceTriangleBvh(ray, anyHit, hit);
 }
 
-bool IsOccluded(
-	vec3 surfacePosition,
-	vec3 surfaceNormal,
-	vec3 directionToLight,
-	float maximumDistance)
+// ------------------------------------------------------------ hit shading
+
+void EvaluateTriangleSurface(
+	TriangleData triangle,
+	vec2 barycentrics,
+	vec3 objectRayDirection,
+	out vec3 shadingNormal,
+	out bool frontFace,
+	out vec3 textureTint)
 {
-	Ray shadowRay;
-	shadowRay.Origin = surfacePosition + surfaceNormal * RAY_EPSILON;
-	shadowRay.Direction = directionToLight;
-	if (u_PushConstants.HardwareSettings.x != 0u &&
-		u_PushConstants.TriangleCount > 0u)
+	vec3 edge1 = triangle.Vertex1.xyz - triangle.Vertex0.xyz;
+	vec3 edge2 = triangle.Vertex2.xyz - triangle.Vertex0.xyz;
+	vec3 normalCross = cross(edge1, edge2);
+	// A degenerate triangle has no plane; facing the ray is the only sensible
+	// orientation for the rare hit on one.
+	vec3 geometricNormal = dot(normalCross, normalCross) > 1e-24
+		? normalize(normalCross)
+		: -normalize(objectRayDirection);
+
+	// The normal matrix preserves the sign of a dot product with a transformed
+	// direction, so facing can be decided in object space.
+	frontFace = dot(objectRayDirection, geometricNormal) < 0.0;
+
+	vec3 objectNormal = geometricNormal;
+	float barycentricW = 1.0 - barycentrics.x - barycentrics.y;
+	if (triangle.Normal0.w > 0.5)
 	{
-		rayQueryEXT query;
-		rayQueryInitializeEXT(
-			query,
-			u_TriangleTlas,
-			gl_RayFlagsOpaqueEXT |
-				gl_RayFlagsTerminateOnFirstHitEXT,
-			0xff,
-			shadowRay.Origin,
-			RAY_EPSILON,
-			shadowRay.Direction,
-			maximumDistance - RAY_EPSILON);
-		while (rayQueryProceedEXT(query))
+		vec3 interpolatedNormal =
+			triangle.Normal0.xyz * barycentricW +
+			triangle.Normal1.xyz * barycentrics.x +
+			triangle.Normal2.xyz * barycentrics.y;
+		if (dot(interpolatedNormal, interpolatedNormal) > 1e-12)
 		{
-		}
-		if (rayQueryGetIntersectionTypeEXT(query, true) !=
-			gl_RayQueryCommittedIntersectionNoneEXT)
-		{
-			return true;
+			objectNormal = normalize(interpolatedNormal);
+			// Imported normals may use the opposite winding convention. Keep the
+			// shading normal in the geometric normal's hemisphere.
+			if (dot(objectNormal, geometricNormal) < 0.0)
+				objectNormal = -objectNormal;
 		}
 	}
 
-	if (u_PushConstants.HardwareSettings.x == 0u &&
-		u_PushConstants.SceneSettings.x == 0u)
+	// Normals transform with the inverse transpose of the model matrix, which is
+	// the transpose of the world to object matrix already at hand.
+	shadingNormal = normalize(
+		transpose(mat3(u_Model.WorldToObject)) * objectNormal);
+	if (!frontFace)
+		shadingNormal = -shadingNormal;
+
+	textureTint = vec3(1.0);
+	if (triangle.TexCoord2.w > 0.5)
 	{
-		for (uint triangleIndex = 0u;
-			triangleIndex < u_PushConstants.TriangleCount;
-			triangleIndex++)
+		vec2 texCoord =
+			triangle.TexCoord01.xy * barycentricW +
+			triangle.TexCoord01.zw * barycentrics.x +
+			triangle.TexCoord2.xy * barycentrics.y;
+		if (triangle.TexCoord2.z > 0.5)
 		{
-			vec3 geometricNormal;
-			vec3 shadingNormal;
-			vec3 textureTint;
-			float hitDistance = HitTriangle(
-				shadowRay,
-				u_TriangleBuffer.Triangles[triangleIndex],
-				geometricNormal,
-				shadingNormal,
-				textureTint);
-			if (hitDistance > 0.0 &&
-				hitDistance < maximumDistance - RAY_EPSILON)
-			{
-				return true;
-			}
+			// stb_image's row zero is the top of the image while OBJ convention
+			// normally treats V=0 as the bottom, so V is flipped at sampling time.
+			// Compute shaders have no implicit derivatives, so the level is
+			// explicit; the images carry a single mip level anyway.
+			vec3 encodedColor = textureLod(
+				u_ModelTexture,
+				vec2(texCoord.x, 1.0 - texCoord.y),
+				0.0).rgb;
+			textureTint = pow(encodedColor, vec3(2.2));
+		}
+		else
+		{
+			ivec2 checkerCell = ivec2(floor(texCoord * 8.0));
+			bool lightCell = ((checkerCell.x + checkerCell.y) & 1) == 0;
+			textureTint = lightCell ? vec3(1.0) : vec3(0.18);
 		}
 	}
-	else if (u_PushConstants.HardwareSettings.x == 0u &&
-		u_PushConstants.TriangleCount > 0u)
-	{
-		vec3 inverseDirection = SafeInverseDirection(shadowRay.Direction);
-		uint triangleNodeStack[BVH_STACK_SIZE];
-		int triangleStackSize = 0;
-		triangleNodeStack[triangleStackSize++] = 0u;
+}
 
-		while (triangleStackSize > 0)
-		{
-			BvhNodeData node = u_TriangleBvhBuffer.Nodes[
-				triangleNodeStack[--triangleStackSize]];
-			if (!HitAabb(
-				shadowRay.Origin,
-				inverseDirection,
-				node.BoundsMin.xyz,
-				node.BoundsMax.xyz,
-				maximumDistance))
-			{
-				continue;
-			}
+bool TraceScene(Ray ray, out HitRecord closestHit)
+{
+	SceneHit hit;
+	hit.Distance = NO_HIT;
+	hit.Kind = HIT_NONE;
+	hit.Index = 0u;
+	hit.Barycentrics = vec2(0.0);
+	TraceSpheres(ray, false, hit);
+	TraceTriangles(ray, false, hit);
 
-			if (node.Links.z > 0u)
-			{
-				for (uint offset = 0u; offset < node.Links.z; offset++)
-				{
-					vec3 geometricNormal;
-					vec3 shadingNormal;
-					vec3 textureTint;
-					float hitDistance = HitTriangle(
-						shadowRay,
-						u_TriangleBuffer.Triangles[node.Links.x + offset],
-						geometricNormal,
-						shadingNormal,
-						textureTint);
-					if (hitDistance > 0.0 &&
-						hitDistance < maximumDistance - RAY_EPSILON)
-					{
-						return true;
-					}
-				}
-				continue;
-			}
-
-			if (triangleStackSize + 2 <= BVH_STACK_SIZE)
-			{
-				triangleNodeStack[triangleStackSize++] = node.Links.y;
-				triangleNodeStack[triangleStackSize++] = node.Links.x;
-			}
-		}
-	}
-
-	if (u_PushConstants.SceneSettings.x == 0u)
-	{
-		for (uint sphereIndex = 0; sphereIndex < u_PushConstants.SphereCount; sphereIndex++)
-		{
-			float hitDistance = HitSphere(
-				shadowRay,
-				u_SphereBuffer.Spheres[sphereIndex]);
-			if (hitDistance > 0.0 &&
-				hitDistance < maximumDistance - RAY_EPSILON)
-				return true;
-		}
-
+	closestHit.Distance = hit.Distance;
+	if (hit.Kind == HIT_NONE)
 		return false;
-	}
 
-	vec3 inverseDirection = SafeInverseDirection(shadowRay.Direction);
-
-	uint nodeStack[BVH_STACK_SIZE];
-	int stackSize = 0;
-	nodeStack[stackSize++] = 0u;
-
-	while (stackSize > 0)
+	closestHit.Position = ray.Origin + ray.Direction * hit.Distance;
+	if (hit.Kind == HIT_SPHERE)
 	{
-		BvhNodeData node = u_BvhBuffer.Nodes[nodeStack[--stackSize]];
-
-		if (!HitAabb(
-			shadowRay.Origin,
-			inverseDirection,
-			node.BoundsMin.xyz,
-			node.BoundsMax.xyz,
-			maximumDistance))
-		{
-			continue;
-		}
-
-		if (node.Links.z > 0u)
-		{
-			// A shadow ray only needs to know whether anything blocks it, so the
-			// first hit ends the search instead of looking for the nearest one.
-			for (uint offset = 0; offset < node.Links.z; offset++)
-			{
-				float hitDistance = HitSphere(
-					shadowRay,
-					u_SphereBuffer.Spheres[node.Links.x + offset]);
-				if (hitDistance > 0.0 &&
-					hitDistance < maximumDistance - RAY_EPSILON)
-					return true;
-			}
-			continue;
-		}
-
-		if (stackSize + 2 <= BVH_STACK_SIZE)
-		{
-			// Deliberately not ordered near to far the way TraceScene is. That
-			// ordering pays off by shrinking the distance the box test prunes
-			// against, and a shadow ray has no such distance: its limit is fixed at
-			// the light and any blocker at all ends the search. So the sort would
-			// cost work per node and buy nothing back.
-			nodeStack[stackSize++] = node.Links.y;
-			nodeStack[stackSize++] = node.Links.x;
-		}
+		SphereData sphere = u_SphereBuffer.Spheres[hit.Index];
+		vec3 outwardNormal = normalize(
+			closestHit.Position - sphere.CenterRadius.xyz);
+		closestHit.FrontFace = dot(ray.Direction, outwardNormal) < 0.0;
+		closestHit.Normal = closestHit.FrontFace ? outwardNormal : -outwardNormal;
+		closestHit.SurfaceMaterial = UnpackMaterial(
+			sphere.AlbedoReflectivity,
+			sphere.RoughnessMaterial);
+		return true;
 	}
 
-	return false;
+	TriangleData triangle = u_TriangleBuffer.Triangles[hit.Index];
+	vec3 textureTint;
+	EvaluateTriangleSurface(
+		triangle,
+		hit.Barycentrics,
+		mat3(u_Model.WorldToObject) * ray.Direction,
+		closestHit.Normal,
+		closestHit.FrontFace,
+		textureTint);
+	closestHit.SurfaceMaterial = UnpackMaterial(
+		triangle.AlbedoReflectivity,
+		triangle.RoughnessMaterial);
+	closestHit.SurfaceMaterial.Albedo *= textureTint;
+	return true;
 }
 
 SphereLight GetSphereLight(uint lightIndex)
@@ -1035,16 +912,56 @@ SphereLight GetSphereLight(uint lightIndex)
 	return light;
 }
 
+// Whether anything lies between the surface and a point maximumDistance away.
+// Emitters count as blockers too, except the one being sampled: a BSDF ray in
+// the same direction would stop at the first emitter it meets, and light
+// sampling has to agree with that for the two strategies to combine correctly.
+bool IsOccluded(
+	vec3 surfacePosition,
+	vec3 surfaceNormal,
+	vec3 directionToLight,
+	float maximumDistance,
+	uint sampledLight)
+{
+	Ray shadowRay;
+	shadowRay.Origin = surfacePosition + surfaceNormal * RAY_EPSILON;
+	shadowRay.Direction = directionToLight;
+
+	SceneHit hit;
+	hit.Distance = maximumDistance - RAY_EPSILON;
+	hit.Kind = HIT_NONE;
+	if (TraceSpheres(shadowRay, true, hit) ||
+		TraceTriangles(shadowRay, true, hit))
+	{
+		return true;
+	}
+
+	for (uint lightIndex = 0u;
+		lightIndex < u_PushConstants.LightCount;
+		lightIndex++)
+	{
+		if (lightIndex == sampledLight)
+			continue;
+
+		SphereLight light = GetSphereLight(lightIndex);
+		float distance = HitSphereGeometry(shadowRay, light.Position, light.Radius);
+		if (distance > 0.0 && distance < hit.Distance)
+			return true;
+	}
+
+	return false;
+}
+
 // Light spheres are not part of the material BVH: there are at most eight, so
 // a short linear scan is cheaper and keeps emitters separate from scene objects.
-// maximumDistance makes a normal sphere hide a light that lies behind it.
+// maximumDistance makes a normal surface hide a light that lies behind it.
 bool TraceSphereLights(
 	Ray ray,
-	uint lightCount,
 	float maximumDistance,
 	out vec3 emission,
 	out uint hitLightIndex)
 {
+	uint lightCount = u_PushConstants.LightCount;
 	float closestDistance = maximumDistance;
 	bool hitAnything = false;
 	emission = vec3(0.0);
@@ -1070,12 +987,21 @@ bool TraceSphereLights(
 	return hitAnything;
 }
 
+// ---------------------------------------------------------------- lighting
+
 float PowerHeuristic(float firstPdf, float secondPdf)
 {
 	float firstSquared = firstPdf * firstPdf;
 	float secondSquared = secondPdf * secondPdf;
 	float denominator = firstSquared + secondSquared;
 	return denominator > 0.0 ? firstSquared / denominator : 0.0;
+}
+
+// sin^2/(1+cos) equals 1-cos but avoids losing the small difference between two
+// nearly equal floats for a tiny, distant light.
+float SphereLightSolidAngle(float sinThetaMaxSquared, float cosThetaMax)
+{
+	return 2.0 * PI * sinThetaMaxSquared / (1.0 + cosThetaMax);
 }
 
 float SphereLightDirectionPdf(vec3 surfacePosition, SphereLight light)
@@ -1088,55 +1014,20 @@ float SphereLightDirectionPdf(vec3 surfacePosition, SphereLight light)
 
 	float sinThetaMaxSquared = radiusSquared / centerDistanceSquared;
 	float cosThetaMax = sqrt(max(0.0, 1.0 - sinThetaMaxSquared));
-	float solidAngle =
-		2.0 * PI * sinThetaMaxSquared / (1.0 + cosThetaMax);
+	float solidAngle = SphereLightSolidAngle(sinThetaMaxSquared, cosThetaMax);
 	return solidAngle > 0.0 ? 1.0 / solidAngle : 0.0;
-}
-
-vec3 CalculateSphereLight(
-	SphereLight light,
-	Material material,
-	vec3 surfaceNormal,
-	vec3 viewDirection,
-	vec3 directionToLight,
-	float lightTechniquePdf,
-	float bsdfPdf,
-	float lightVisibility)
-{
-	float surfaceCosine = max(dot(surfaceNormal, directionToLight), 0.0);
-	if (surfaceCosine <= 0.0 || lightTechniquePdf <= 0.0)
-		return vec3(0.0);
-
-	vec3 emittedRadiance = light.Color * light.Intensity;
-	vec3 brdf = EvaluateSurfaceBrdf(
-		material,
-		surfaceNormal,
-		viewDirection,
-		directionToLight);
-	float misWeight = PowerHeuristic(lightTechniquePdf, bsdfPdf);
-	return
-		brdf *
-		emittedRadiance *
-		surfaceCosine *
-		lightVisibility /
-		lightTechniquePdf *
-		misWeight;
 }
 
 // Picks one light in proportion to the slice of the total weight it was given on
 // the CPU, and reports the probability of that pick so the caller can divide the
 // contribution by it. Returns false only when no light carries any weight, which
 // means every one of them would have contributed exactly zero.
-//
-// The slices are scanned in order rather than binary searched because the light
-// count is capped at eight; the bounds are stored as a running total precisely so
-// that a search can replace this loop once the cap grows.
 bool SelectSphereLight(
-	uint lightCount,
 	inout uint randomState,
 	out uint selectedLight,
 	out float selectionProbability)
 {
+	uint lightCount = u_PushConstants.LightCount;
 	float random = NextRandom(randomState);
 
 	selectedLight = lightCount;
@@ -1146,14 +1037,10 @@ bool SelectSphereLight(
 	{
 		float probability = u_LightBuffer.Lights[lightIndex].RadiusSampling.w;
 
-		// A zero slice belongs to a light that cannot contribute at all, and its
-		// bound repeats the previous one, so skipping it changes no other pick.
+		// A zero slice belongs to a light that cannot contribute at all.
 		if (probability <= 0.0)
 			continue;
 
-		// Remembered on every candidate so that a random value of exactly one,
-		// which no bound is strictly greater than, still ends up on a light with a
-		// probability that can be divided by instead of dropping the sample.
 		selectedLight = lightIndex;
 		selectionProbability = probability;
 
@@ -1196,25 +1083,23 @@ vec3 SampleSphereLight(
 		float sinThetaMaxSquared =
 			radiusSquared / centerDistanceSquared;
 		float cosThetaMax = sqrt(max(0.0, 1.0 - sinThetaMaxSquared));
-		float firstRandom = NextRandom(randomState);
-		float secondRandom = NextRandom(randomState);
-		float cosTheta = mix(1.0, cosThetaMax, firstRandom);
+		float cosTheta = mix(1.0, cosThetaMax, NextRandom(randomState));
 		float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
-		float angle = 2.0 * PI * secondRandom;
+		float angle = 2.0 * PI * NextRandom(randomState);
 		vec3 localDirection = vec3(
 			cos(angle) * sinTheta,
 			sin(angle) * sinTheta,
 			cosTheta);
 
-		directionToLight = LocalToWorld(
-			localDirection,
-			directionToCenter);
-		// sin^2/(1+cos) equals 1-cos but avoids losing the small difference
-		// between two nearly equal floats for a tiny, distant light.
-		float solidAngle =
-			2.0 * PI * sinThetaMaxSquared / (1.0 + cosThetaMax);
-		lightDirectionPdf = 1.0 / solidAngle;
+		directionToLight = LocalToWorld(localDirection, directionToCenter);
+		lightDirectionPdf =
+			1.0 / SphereLightSolidAngle(sinThetaMaxSquared, cosThetaMax);
 	}
+
+	float surfaceCosine = max(dot(hit.Normal, directionToLight), 0.0);
+	float lightTechniquePdf = lightSelectionProbability * lightDirectionPdf;
+	if (surfaceCosine <= 0.0 || lightTechniquePdf <= 0.0)
+		return vec3(0.0);
 
 	Ray lightRay;
 	lightRay.Origin = hit.Position;
@@ -1223,45 +1108,61 @@ vec3 SampleSphereLight(
 		lightRay,
 		light.Position,
 		light.Radius);
-	if (lightDistance <= 0.0)
+	if (lightDistance <= 0.0 ||
+		IsOccluded(
+			hit.Position,
+			hit.Normal,
+			directionToLight,
+			lightDistance,
+			lightIndex))
+	{
 		return vec3(0.0);
+	}
 
-	bool isInShadow = IsOccluded(
-		hit.Position,
+	vec3 brdf = EvaluateSurfaceBrdf(
+		hit.SurfaceMaterial,
 		hit.Normal,
-		directionToLight,
-		lightDistance);
-
-	float lightVisibility = isInShadow ? 0.0 : 1.0;
-	float lightTechniquePdf =
-		lightSelectionProbability * lightDirectionPdf;
+		viewDirection,
+		directionToLight);
 	float bsdfPdf = SurfaceDirectionPdf(
 		hit.SurfaceMaterial,
 		hit.Normal,
 		viewDirection,
 		directionToLight);
-	return CalculateSphereLight(
-		light,
-		hit.SurfaceMaterial,
-		hit.Normal,
-		viewDirection,
-		directionToLight,
-		lightTechniquePdf,
-		bsdfPdf,
-		lightVisibility);
+	float misWeight = PowerHeuristic(lightTechniquePdf, bsdfPdf);
+	return brdf * light.Color * light.Intensity * surfaceCosine /
+		lightTechniquePdf * misWeight;
+}
+
+// The same formula as EnvironmentTexelSolidAngle on the CPU: the polar band a
+// row covers, written as a product of sines so thin polar rows stay accurate.
+float EnvironmentTexelSolidAngle(uint row)
+{
+	float width = float(u_PushConstants.EnvironmentWidth);
+	float height = float(u_PushConstants.EnvironmentHeight);
+	float halfRowAngle = PI / (2.0 * height);
+	float rowCenterAngle = PI * (2.0 * float(row) + 1.0) / (2.0 * height);
+	return 2.0 * PI / width * 2.0 * sin(rowCenterAngle) * sin(halfRowAngle);
+}
+
+// Equirectangular mapping: u follows the longitude around +Y and v the polar
+// angle measured down from +Y, so v = 0 is straight up.
+vec2 DirectionToEnvironmentUv(vec3 direction)
+{
+	float longitude = atan(direction.z, direction.x) +
+		u_PushConstants.EnvironmentRotation;
+	float polarAngle = acos(clamp(direction.y, -1.0, 1.0));
+	return vec2(fract(longitude / (2.0 * PI) + 0.5), polarAngle / PI);
 }
 
 vec3 GetSkyColor(vec3 rayDirection)
 {
-	if (u_PushConstants.HasEnvironmentMap != 0u)
+	if (HasFlag(RENDER_FLAG_ENVIRONMENT_MAP))
 	{
-		float longitude = atan(rayDirection.z, rayDirection.x) +
-			u_PushConstants.EnvironmentRotation;
-		float latitude = asin(clamp(rayDirection.y, -1.0, 1.0));
-		vec2 environmentUv = vec2(
-			longitude / (2.0 * PI) + 0.5,
-			0.5 - latitude / PI);
-		return texture(u_EnvironmentTexture, environmentUv).rgb *
+		return textureLod(
+			u_EnvironmentTexture,
+			DirectionToEnvironmentUv(rayDirection),
+			0.0).rgb *
 			u_PushConstants.EnvironmentIntensity;
 	}
 
@@ -1274,60 +1175,70 @@ vec3 GetSkyColor(vec3 rayDirection)
 
 float EnvironmentDirectionPdf(vec3 direction)
 {
-	uint width = u_PushConstants.HardwareSettings.y;
-	uint height = u_PushConstants.HardwareSettings.z;
-	if (width == 0u || height == 0u)
+	uint width = u_PushConstants.EnvironmentWidth;
+	uint height = u_PushConstants.EnvironmentHeight;
+	if (!HasFlag(RENDER_FLAG_ENVIRONMENT_MAP) || width == 0u || height == 0u)
 		return 0.0;
-	float longitude = atan(direction.z, direction.x) + u_PushConstants.EnvironmentRotation;
-	float latitude = asin(clamp(direction.y, -1.0, 1.0));
-	vec2 uv = vec2(fract(longitude / (2.0 * PI) + 0.5),
-		clamp(0.5 - latitude / PI, 0.0, 0.999999));
-	uvec2 texel = uvec2(uv * vec2(width, height));
-	// fract() can return values extremely close to 1.0 due to floating-point
-	// precision, which makes texel.x == width after the uint cast. Clamping
-	// both axes prevents an out-of-bounds read from the distribution buffer.
-	texel = min(texel, uvec2(width - 1u, height - 1u));
-	uint index = texel.y * width + texel.x;
-	float mass = u_EnvironmentDistribution.Entries[index].y;
-	float theta = PI * (float(texel.y) + 0.5) / float(height);
-	float solidAngle = (2.0 * PI / float(width)) * (PI / float(height)) *
-		max(sin(theta), 1e-6);
-	return mass / solidAngle;
+
+	// Clamping both axes keeps a coordinate that rounds to exactly one from
+	// reading past the distribution buffer.
+	uvec2 texel = min(
+		uvec2(DirectionToEnvironmentUv(direction) * vec2(width, height)),
+		uvec2(width - 1u, height - 1u));
+	float mass = u_EnvironmentDistribution.Entries[texel.y * width + texel.x].y;
+	return mass / EnvironmentTexelSolidAngle(texel.y);
 }
 
+// Picks a texel in proportion to its luminance times solid angle, then a
+// direction uniformly by solid angle inside it, so the density is exactly the
+// texel's probability over its solid angle, which EnvironmentDirectionPdf returns.
 vec3 SampleEnvironmentLight(HitRecord hit, Material material, inout uint randomState)
 {
-	uint width = u_PushConstants.HardwareSettings.y;
-	uint height = u_PushConstants.HardwareSettings.z;
+	uint width = u_PushConstants.EnvironmentWidth;
+	uint height = u_PushConstants.EnvironmentHeight;
 	uint count = width * height;
-	if (u_PushConstants.HardwareSettings.w == 0u || count == 0u)
+	if (!HasFlag(RENDER_FLAG_ENVIRONMENT_MAP) || count == 0u)
 		return vec3(0.0);
+
 	float target = NextRandom(randomState);
 	uint lower = 0u;
 	uint upper = count - 1u;
 	while (lower < upper)
 	{
 		uint middle = lower + (upper - lower) / 2u;
-		if (u_EnvironmentDistribution.Entries[middle].x < target)
+		if (u_EnvironmentDistribution.Entries[middle].x <= target)
 			lower = middle + 1u;
 		else
 			upper = middle;
 	}
+
 	uvec2 texel = uvec2(lower % width, lower / width);
-	vec2 uv = (vec2(texel) + vec2(NextRandom(randomState), NextRandom(randomState))) /
-		vec2(width, height);
-	float longitude = (uv.x - 0.5) * 2.0 * PI - u_PushConstants.EnvironmentRotation;
-	float latitude = (0.5 - uv.y) * PI;
-	float cosLatitude = cos(latitude);
-	vec3 direction = normalize(vec3(cosLatitude * cos(longitude), sin(latitude),
-		cosLatitude * sin(longitude)));
+	float u = (float(texel.x) + NextRandom(randomState)) / float(width);
+	float topCosine = cos(PI * float(texel.y) / float(height));
+	float bottomCosine = cos(PI * float(texel.y + 1u) / float(height));
+	float cosPolar = mix(topCosine, bottomCosine, NextRandom(randomState));
+	float sinPolar = sqrt(max(0.0, 1.0 - cosPolar * cosPolar));
+	float longitude = (u - 0.5) * 2.0 * PI - u_PushConstants.EnvironmentRotation;
+	vec3 direction = vec3(
+		sinPolar * cos(longitude),
+		cosPolar,
+		sinPolar * sin(longitude));
+
 	float cosine = max(dot(hit.Normal, direction), 0.0);
-	float environmentPdf = EnvironmentDirectionPdf(direction);
+	float texelProbability = u_EnvironmentDistribution.Entries[lower].y;
+	float environmentPdf = texelProbability / EnvironmentTexelSolidAngle(texel.y);
 	if (cosine <= 0.0 || environmentPdf <= 0.0 ||
-		IsOccluded(hit.Position, hit.Normal, direction, 1e30))
+		IsOccluded(
+			hit.Position,
+			hit.Normal,
+			direction,
+			NO_HIT,
+			u_PushConstants.LightCount))
+	{
 		return vec3(0.0);
-	float bsdfPdf = LambertPdf(hit.Normal, direction);
-	float weight = PowerHeuristic(environmentPdf, bsdfPdf);
+	}
+
+	float weight = PowerHeuristic(environmentPdf, LambertPdf(hit.Normal, direction));
 	return EvaluateLambertBrdf(material) * GetSkyColor(direction) *
 		cosine * weight / environmentPdf;
 }
@@ -1360,16 +1271,16 @@ vec3 LinearToSrgb(vec3 linearColor)
 		lessThanEqual(safeColor, vec3(0.0031308)));
 }
 
-vec3 TraceRay(
-	Ray initialRay,
-	uint randomSeed)
+// ------------------------------------------------------------- path tracing
+
+vec3 TraceRay(Ray initialRay, uint randomSeed)
 {
 	Ray ray = initialRay;
 	vec3 accumulatedColor = vec3(0.0);
 	vec3 throughput = vec3(1.0);
 	uint randomState = randomSeed;
-	uint lightCount = u_PushConstants.SceneSettings.y;
-	bool sampleOneLight = u_PushConstants.SceneSettings.z != 0u;
+	uint lightCount = u_PushConstants.LightCount;
+	bool sampleOneLight = HasFlag(RENDER_FLAG_STOCHASTIC_LIGHTS);
 	bool previousBounceUsedDirectLighting = false;
 	bool previousBounceSampledEnvironment = false;
 	vec3 previousSurfacePosition = vec3(0.0);
@@ -1377,7 +1288,7 @@ vec3 TraceRay(
 
 	for (
 		uint bounceIndex = 0u;
-		bounceIndex < u_PushConstants.SceneSettings.w;
+		bounceIndex < u_PushConstants.BounceCount;
 		bounceIndex++)
 	{
 		// After three guaranteed segments, a weak path survives in proportion to
@@ -1408,7 +1319,6 @@ vec3 TraceRay(
 		// contributes its own emitted radiance instead of behaving like a material.
 		if (TraceSphereLights(
 			ray,
-			lightCount,
 			closestHit.Distance,
 			lightEmission,
 			hitLightIndex))
@@ -1422,16 +1332,11 @@ vec3 TraceRay(
 					: 1.0;
 				float lightTechniquePdf =
 					lightSelectionProbability *
-					SphereLightDirectionPdf(
-						previousSurfacePosition,
-						hitLight);
-				emitterWeight = PowerHeuristic(
-					previousBsdfPdf,
-					lightTechniquePdf);
+					SphereLightDirectionPdf(previousSurfacePosition, hitLight);
+				emitterWeight = PowerHeuristic(previousBsdfPdf, lightTechniquePdf);
 			}
 
-			accumulatedColor +=
-				throughput * lightEmission * emitterWeight;
+			accumulatedColor += throughput * lightEmission * emitterWeight;
 			break;
 		}
 
@@ -1461,11 +1366,7 @@ vec3 TraceRay(
 				// probability keeps the expected value equal to the full light sum.
 				uint lightIndex;
 				float selectionProbability;
-				if (SelectSphereLight(
-					lightCount,
-					randomState,
-					lightIndex,
-					selectionProbability))
+				if (SelectSphereLight(randomState, lightIndex, selectionProbability))
 				{
 					surfaceColor += SampleSphereLight(
 						lightIndex,
@@ -1479,7 +1380,7 @@ vec3 TraceRay(
 			{
 				// Every light is sampled independently and its contribution is
 				// summed, so light count multiplies the shadow ray cost per bounce.
-				for (uint lightIndex = 0; lightIndex < lightCount; lightIndex++)
+				for (uint lightIndex = 0u; lightIndex < lightCount; lightIndex++)
 				{
 					surfaceColor += SampleSphereLight(
 						lightIndex,
@@ -1493,32 +1394,19 @@ vec3 TraceRay(
 
 		if (material.Type == MATERIAL_DIFFUSE)
 		{
-			surfaceColor += SampleEnvironmentLight(
-				closestHit, material, randomState);
+			surfaceColor += SampleEnvironmentLight(closestHit, material, randomState);
 			// Direct light is one part of the answer. The new cosine-weighted ray
 			// carries the other part: light arriving after one or more surface bounces.
 			accumulatedColor += throughput * surfaceColor;
-			ray.Origin =
-				closestHit.Position +
-				closestHit.Normal * RAY_EPSILON;
-			ray.Direction = RandomCosineHemisphere(
-				closestHit.Normal,
-				randomState);
-			float surfaceCosine = max(dot(
-				closestHit.Normal,
-				ray.Direction), 0.0);
-			float directionPdf = LambertPdf(
-				closestHit.Normal,
-				ray.Direction);
+			ray.Origin = closestHit.Position + closestHit.Normal * RAY_EPSILON;
+			ray.Direction = RandomCosineHemisphere(closestHit.Normal, randomState);
+			float surfaceCosine = max(dot(closestHit.Normal, ray.Direction), 0.0);
+			float directionPdf = LambertPdf(closestHit.Normal, ray.Direction);
 			if (directionPdf <= 0.0)
 				break;
-			throughput *=
-				EvaluateLambertBrdf(material) *
-				surfaceCosine /
-				directionPdf;
+			throughput *= EvaluateLambertBrdf(material) * surfaceCosine / directionPdf;
 			previousBounceUsedDirectLighting = true;
-			previousBounceSampledEnvironment =
-				u_PushConstants.HardwareSettings.w != 0u;
+			previousBounceSampledEnvironment = HasFlag(RENDER_FLAG_ENVIRONMENT_MAP);
 			previousSurfacePosition = closestHit.Position;
 			previousBsdfPdf = directionPdf;
 			continue;
@@ -1535,9 +1423,7 @@ vec3 TraceRay(
 					material.Albedo,
 					vec3(0.001),
 					vec3(1.0));
-				throughput *= pow(
-					transmittancePerUnit,
-					vec3(closestHit.Distance));
+				throughput *= pow(transmittancePerUnit, vec3(closestHit.Distance));
 			}
 
 			// Entering glass goes from air (1.0) to the material IOR; leaving it
@@ -1547,40 +1433,28 @@ vec3 TraceRay(
 				: material.IndexOfRefraction;
 			vec3 unitDirection = normalize(ray.Direction);
 			float cosTheta = min(dot(-unitDirection, closestHit.Normal), 1.0);
-			
+
+			// Schlick has to be evaluated on the air side of the interface, which
+			// is the transmitted angle when the ray is leaving the glass.
 			float schlickCosTheta = cosTheta;
 			bool cannotRefract = false;
-			
-			if (!closestHit.FrontFace)
-			{
-				float eta = material.IndexOfRefraction;
-				float sinThetaTSq = eta * eta * (1.0 - cosTheta * cosTheta);
-				if (sinThetaTSq >= 1.0)
-					cannotRefract = true;
-				else
-					schlickCosTheta = sqrt(1.0 - sinThetaTSq);
-			}
-			else
-			{
-				float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
-				cannotRefract = refractionRatio * sinTheta > 1.0;
-			}
+			float sinThetaTSquared =
+				refractionRatio * refractionRatio * (1.0 - cosTheta * cosTheta);
+			if (sinThetaTSquared >= 1.0)
+				cannotRefract = true;
+			else if (!closestHit.FrontFace)
+				schlickCosTheta = sqrt(1.0 - sinThetaTSquared);
 
 			// When Snell's law has no real solution, all energy must reflect. In
 			// every other case Schlick chooses between reflection and refraction.
-			float reflectionProbability = SchlickReflectance(
-				schlickCosTheta,
-				material.IndexOfRefraction);
 			bool shouldReflect =
 				cannotRefract ||
-				reflectionProbability > NextRandom(randomState);
+				SchlickReflectance(schlickCosTheta, material.IndexOfRefraction) >
+					NextRandom(randomState);
 
 			ray.Direction = shouldReflect
 				? normalize(reflect(unitDirection, closestHit.Normal))
-				: normalize(refract(
-					unitDirection,
-					closestHit.Normal,
-					refractionRatio));
+				: normalize(refract(unitDirection, closestHit.Normal, refractionRatio));
 			// Offsetting along the new direction puts an entering ray inside and an
 			// exiting ray outside without assuming which side reflection chose.
 			ray.Origin = closestHit.Position + ray.Direction * RAY_EPSILON;
@@ -1594,8 +1468,7 @@ vec3 TraceRay(
 		{
 			// Old scene files keep the original hybrid model exactly: part of the
 			// energy uses diffuse lighting and the rest continues as a reflection.
-			accumulatedColor +=
-				throughput * surfaceColor * (1.0 - reflectivity);
+			accumulatedColor += throughput * surfaceColor * (1.0 - reflectivity);
 		}
 
 		if (reflectivity <= 0.0)
@@ -1604,17 +1477,13 @@ vec3 TraceRay(
 		if (material.Type == MATERIAL_METAL)
 		{
 			accumulatedColor += throughput * surfaceColor;
-			ray.Origin =
-				closestHit.Position +
-				closestHit.Normal * RAY_EPSILON;
+			ray.Origin = closestHit.Position + closestHit.Normal * RAY_EPSILON;
 			ray.Direction = SampleGgxReflection(
 				material,
 				closestHit.Normal,
 				viewDirection,
 				randomState);
-			float surfaceCosine = max(dot(
-				closestHit.Normal,
-				ray.Direction), 0.0);
+			float surfaceCosine = max(dot(closestHit.Normal, ray.Direction), 0.0);
 			float directionPdf = MetalReflectionPdf(
 				material,
 				closestHit.Normal,
@@ -1640,24 +1509,17 @@ vec3 TraceRay(
 
 		// Legacy keeps the original tinted reflection model for old scene files.
 		throughput *= material.Albedo * reflectivity;
+		ray.Origin = closestHit.Position + closestHit.Normal * RAY_EPSILON;
 
-		ray.Origin =
-			closestHit.Position +
-			closestHit.Normal * RAY_EPSILON;
-
-		vec3 perfectReflection = normalize(reflect(
-			ray.Direction,
-			closestHit.Normal));
-
+		vec3 perfectReflection = normalize(reflect(ray.Direction, closestHit.Normal));
 		vec3 randomDirection = RandomUnitVector(randomState);
 		if (dot(randomDirection, closestHit.Normal) < 0.0)
 			randomDirection = -randomDirection;
 
-		float roughness = material.Roughness;
 		ray.Direction = normalize(mix(
 			perfectReflection,
 			randomDirection,
-			roughness));
+			material.Roughness));
 		previousBounceUsedDirectLighting = false;
 		previousBounceSampledEnvironment = false;
 	}
@@ -1673,17 +1535,15 @@ void main()
 	if (pixel.x >= imageSize.x || pixel.y >= imageSize.y)
 		return;
 
-	uint pixelSeed =
-		uint(pixel.x) +
-		uint(pixel.y) * uint(imageSize.x);
-	uint frameSeed = pixelSeed ^ (u_PushConstants.FrameIndex * 0x9e3779b9u);
+	// Hashing the frame index before mixing it in keeps neighbouring pixels in
+	// neighbouring frames from starting on related random sequences.
+	uint pixelSeed = uint(pixel.x) + uint(pixel.y) * uint(imageSize.x);
+	uint frameSeed = Hash(pixelSeed ^ Hash(u_PushConstants.FrameIndex));
 	vec2 pixelJitter = vec2(
 		RandomFloat(frameSeed),
 		RandomFloat(frameSeed ^ 0x68bc21ebu)) - 0.5;
 
-	vec2 uv =
-		(vec2(pixel) + vec2(0.5) + pixelJitter) /
-		vec2(imageSize);
+	vec2 uv = (vec2(pixel) + vec2(0.5) + pixelJitter) / vec2(imageSize);
 	vec2 screenPosition = uv * 2.0 - 1.0;
 	// Image rows grow downwards while world up is +Y, so this is the single
 	// place the two conventions are reconciled: row 0 becomes the top of the
@@ -1691,8 +1551,7 @@ void main()
 	screenPosition.y = -screenPosition.y;
 
 	float aspectRatio = float(imageSize.x) / float(imageSize.y);
-	float fieldOfView = radians(u_PushConstants.VerticalFov);
-	float fieldOfViewScale = tan(fieldOfView * 0.5);
+	float fieldOfViewScale = tan(radians(u_PushConstants.VerticalFov) * 0.5);
 
 	vec3 cameraForward = normalize(u_PushConstants.CameraForward.xyz);
 	vec3 worldUp = vec3(0.0, 1.0, 0.0);
@@ -1705,39 +1564,24 @@ void main()
 	ray.Origin = u_PushConstants.CameraPosition.xyz;
 	ray.Direction = normalize(
 		cameraForward +
-		cameraRight *
-			screenPosition.x *
-			aspectRatio *
-			fieldOfViewScale +
-		cameraUp *
-			screenPosition.y *
-			fieldOfViewScale);
+		cameraRight * screenPosition.x * aspectRatio * fieldOfViewScale +
+		cameraUp * screenPosition.y * fieldOfViewScale);
 
-	uint pathSeed = frameSeed ^ 0xa511e9b3u;
-	vec3 sampleColor = TraceRay(ray, pathSeed);
+	vec3 sampleColor = TraceRay(ray, frameSeed ^ 0xa511e9b3u);
 	// One invalid floating-point path must not poison this pixel forever because
 	// every later frame reads the previous accumulation before adding its sample.
 	if (any(isnan(sampleColor)) || any(isinf(sampleColor)))
 		sampleColor = vec3(0.0);
 	else
 		sampleColor = max(sampleColor, vec3(0.0));
-	vec3 previousAccumulation =
-		u_PushConstants.FrameIndex > 1
-			? imageLoad(u_AccumulationImage, pixel).rgb
-			: vec3(0.0);
 
+	vec3 previousAccumulation = u_PushConstants.FrameIndex > 1u
+		? imageLoad(u_AccumulationImage, pixel).rgb
+		: vec3(0.0);
 	vec3 accumulatedColor = previousAccumulation + sampleColor;
-	imageStore(
-		u_AccumulationImage,
-		pixel,
-		vec4(accumulatedColor, 1.0));
+	imageStore(u_AccumulationImage, pixel, vec4(accumulatedColor, 1.0));
 
-	vec3 averageColor =
-		accumulatedColor /
-		float(u_PushConstants.FrameIndex);
-
-	vec3 exposedColor = averageColor * u_PushConstants.Exposure;
-	vec3 toneMappedColor = ToneMapAces(exposedColor);
-	vec3 displayColor = LinearToSrgb(toneMappedColor);
+	vec3 averageColor = accumulatedColor / float(u_PushConstants.FrameIndex);
+	vec3 displayColor = LinearToSrgb(ToneMapAces(averageColor * u_PushConstants.Exposure));
 	imageStore(u_OutputImage, pixel, vec4(displayColor, 1.0));
 }

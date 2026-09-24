@@ -9,6 +9,7 @@ project "WalnutApp"
 
    includedirs
    {
+      "src",
       "../vendor/imgui",
       "../vendor/glfw/include",
 
@@ -27,11 +28,17 @@ project "WalnutApp"
    objdir ("../bin-int/" .. outputdir .. "/%{prj.name}")
    debugdir "%{wks.location}/WalnutApp"
 
+   -- The shader is compiled twice: with ray queries for devices that support
+   -- them, and without as the fallback the renderer picks everywhere else.
    local VulkanSDK = os.getenv("VULKAN_SDK")
+   local glslc = "\"" .. VulkanSDK .. "/Bin/glslc.exe\" --target-env=vulkan1.2"
+   local shaderSource = "\"%{wks.location}/WalnutApp/src/Shaders/RayTracing.comp\""
+   local shaderOutput = "%{wks.location}/WalnutApp/assets/shaders/"
    prebuildcommands
    {
       "{MKDIR} \"%{wks.location}/WalnutApp/assets/shaders\"",
-      "\"" .. VulkanSDK .. "/Bin/glslc.exe\" --target-env=vulkan1.2 \"%{wks.location}/WalnutApp/src/Shaders/RayTracing.comp\" -o \"%{wks.location}/WalnutApp/assets/shaders/RayTracing.comp.spv\""
+      glslc .. " -DUSE_RAY_QUERY " .. shaderSource .. " -o \"" .. shaderOutput .. "RayTracing.comp.spv\"",
+      glslc .. " " .. shaderSource .. " -o \"" .. shaderOutput .. "RayTracingFallback.comp.spv\""
    }
 
    filter "system:windows"
